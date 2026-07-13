@@ -1,0 +1,41 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "forge"
+version = "0.1.0"
+description = "A minimal but complete terminal-based AI coding agent."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+dependencies = [
+    "google-genai",
+    "mcp",
+    "tomli-w",
+    "prompt_toolkit",
+]
+
+[project.optional-dependencies]
+dev = [
+    "hypothesis",
+    "pytest",
+]
+
+[project.scripts]
+forge = "forge.__main__:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["forge*"]
+
+# Bundle forge/data/ (including system_prompt.md) as package data so it is
+# installed alongside the package and loadable at runtime via importlib.resources.
+[tool.setuptools.package-data]
+forge = ["data/*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py", "*_test.py"]
+python_classes = ["Test*"]
+python_functions = ["test_*"]
