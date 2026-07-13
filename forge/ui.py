@@ -9,6 +9,8 @@ from __future__ import annotations
 
 import contextlib
 
+from forge.memory import redact_secrets
+
 try:
     from rich.console import Console
     from rich.syntax import Syntax
@@ -82,10 +84,13 @@ def describe_tool(name: str, args: dict | None) -> str | None:
     if name == "delegate":
         return _clip(args.get("task")) if args.get("task") else None
 
-    # Generic: surface the first non-empty string argument.
+    # Generic: surface the first non-empty string argument. This path handles
+    # unknown/future tools (e.g. MCP) whose args are not modelled above and may
+    # carry secrets (tokens, passwords), so the value is run through the same
+    # best-effort secret redaction the memory store uses before display.
     for key, value in args.items():
         if isinstance(value, str) and value:
-            return f"{key}={_clip(value)}"
+            return f"{key}={_clip(redact_secrets(value))}"
     return None
 
 

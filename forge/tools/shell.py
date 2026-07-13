@@ -127,11 +127,16 @@ def execute_command(
     rendering and applying ``output_cap`` (via :func:`_render` / :func:`_cap`)
     so each caller can flag truncation independently.
 
-    ``output_cap`` is accepted as part of the shared execution contract so all
-    callers share one signature; the cap itself is applied at the presentation
-    layer.
+    ``output_cap`` sets the *presentation* limit (applied by callers when
+    rendering the result), and here it also derives the per-stream memory
+    ceiling used while draining: a stream retains at most
+    :func:`_drain_ceiling` bytes so a runaway command (``yes``, a broken build)
+    cannot exhaust RAM before the output is ever truncated. Draining continues
+    reading past the ceiling (discarding the excess) so the child's pipe never
+    blocks; the retained bytes still exceed ``output_cap`` so the caller's
+    render-time truncation flag trips exactly as before.
     """
-    del output_cap  # capping is applied by callers when rendering the result.
+    drain_ceiling = _drain_ceiling(output_cap)
 
     argv = _shell_argv(command)
     popen_kwargs = _spawn_kwargs()
@@ -159,10 +164,10 @@ def execute_command(
     out_chunks: list[bytes] = []
     err_chunks: list[bytes] = []
     out_thread = threading.Thread(
-        target=_drain, args=(proc.stdout, out_chunks), daemon=True
+        target=_drain, args=(proc.stdout, out_chunks, drain_ceiling), daemon=True
     )
     err_thread = threading.Thread(
-        target=_drain, args=(proc.stderr, err_chunks), daemon=True
+        target=_drain, args=(proc.stderr, err_chunks, drain_ceiling), daemon=True
     )
     out_thread.start()
     err_thread.start()
@@ -455,13 +460,47 @@ def _wait_quietly(proc: subprocess.Popen, timeout: float) -> bool:
         return False
 
 
-def _drain(stream: Any, sink: list[bytes]) -> None:
-    """Read a binary stream to EOF, appending chunks to ``sink``."""
+# Per-stream memory ceiling floor: even a tiny configured output cap retains at
+# least this many bytes before discarding, so draining never blocks the child's
+# pipe and the render-time truncation flag still trips. Kept comfortably above
+# the default output cap (30k) so normal large-output commands are unaffected.
+_DRAIN_CEILING_FLOOR = 1_000_000
+
+
+def _drain_ceiling(output_cap: int) -> int:
+    """Return the per-stream byte ceiling used while draining a command.
+
+    Scales with the presentation ``output_cap`` (2x) but never drops below
+    :data:`_DRAIN_CEILING_FLOOR`, so the retained bytes always exceed the
+    render cap (keeping truncation detection intact) while staying bounded no
+    matter how much a runaway command emits.
+    """
+    try:
+        cap = int(output_cap)
+    except (TypeError, ValueError):
+        cap = 0
+    return max(cap * 2, _DRAIN_CEILING_FLOOR)
+
+
+def _drain(stream: Any, sink: list[bytes], byte_ceiling: int | None = None) -> None:
+    """Read a binary stream to EOF, appending chunks to ``sink``.
+
+    When ``byte_ceiling`` is set, stop *retaining* chunks once the accumulated
+    byte total crosses the ceiling but keep reading to EOF (discarding the
+    excess) so the child's pipe never fills and blocks. This bounds memory for
+    a command that emits unbounded output (e.g. ``yes``) while still draining
+    the pipe so the process can exit or be terminated by the timeout/interrupt.
+    """
     if stream is None:  # pragma: no cover - defensive
         return
+    total = 0
     try:
         for chunk in iter(lambda: stream.read(4096), b""):
-            sink.append(chunk)
+            if byte_ceiling is None or total < byte_ceiling:
+                sink.append(chunk)
+                total += len(chunk)
+            # Past the ceiling: read and discard to keep the pipe draining
+            # without growing memory.
     except (ValueError, OSError):  # pragma: no cover - stream closed under us
         pass
     finally:

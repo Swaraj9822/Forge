@@ -15,6 +15,7 @@ from typing import TextIO
 from forge.agent import AgentLoop, NullRenderer, TurnResult
 from forge.policy import AutoApprover, DenyMutationsApprover
 from forge.session import Session
+from forge.ui import describe_tool
 from forge.usage import UsageSummary
 
 # Exit codes (documented contract for CI).
@@ -40,8 +41,6 @@ class _CapturingRenderer:
 
     def on_tool(self, name: str, args: dict | None = None) -> None:
         if self._echo is not None:
-            from forge.ui import describe_tool
-
             detail = describe_tool(name, args)
             line = f"\n[tool: {name}]" + (f" {detail}" if detail else "") + "\n"
             self._echo.write(line)

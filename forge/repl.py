@@ -63,6 +63,7 @@ if TYPE_CHECKING:  # pragma: no cover - imported only for type checking
     # no real cycle exists; guarding the import keeps the coupling annotation-only
     # and avoids any ordering fragility during bootstrap.
     from forge.checkpoint import CheckpointStore
+    from forge.config import Config
     from forge.verification import (
         VerificationCoordinator,
         VerificationRenderer,
@@ -271,7 +272,7 @@ class Repl:
         mentions_enabled: bool = False,
         read_max_bytes: int = 1_000_000,
         workspace_root: Path | None = None,
-        config: Any | None = None,
+        config: "Config | None" = None,
     ) -> None:
         self.agent_loop = agent_loop
         self.session = session
@@ -444,7 +445,8 @@ class Repl:
             self._stop_spinner()
         elapsed = time.monotonic() - turn_start
 
-        # After a turn that completed normally (not interrupted, no error), run        # the post-turn Verification_Phase when a coordinator is wired. When the
+        # After a turn that completed normally (not interrupted, no error), run
+        # the post-turn Verification_Phase when a coordinator is wired. When the
         # phase ran, its aggregated usage (turn + all Correction_Iterations)
         # replaces the bare turn usage in the summary; otherwise rendering is
         # exactly as today (Req 2.3, 9, 10).

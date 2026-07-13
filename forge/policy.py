@@ -135,6 +135,27 @@ class ShellMatcher:
 # policy fail *closed*: an unrecognized operation is gated, not waved through.
 _GIT_READONLY = frozenset({"status", "diff", "log", "show", "branch"})
 
+# Flags that write output to a file — a side effect even for an otherwise
+# read-only git op (e.g. ``git diff --output=FILE`` / ``-o FILE``). Their
+# presence means the invocation is not side-effect-free and must not be
+# auto-classified read-only.
+_GIT_FILE_OUTPUT_FLAGS = frozenset({"-o", "--output"})
+
+# Read-only "listing" flags for ``git branch``. ``branch`` is side-effect-free
+# only when every argument is one of these (or an ``=value`` form). A bare
+# positional argument to ``branch`` names a branch to CREATE, and flags like
+# ``-d``/``-D``/``-m``/``-M``/``-c``/``-f``/``--set-upstream-to`` delete, rename,
+# copy, force, or re-point refs — all mutating. Anything outside this allowlist
+# therefore makes ``branch`` mutating, so classification fails closed: an
+# unrecognized or positional argument is gated, not waved through as read-only.
+_GIT_BRANCH_READONLY_FLAGS = frozenset({
+    "-a", "--all", "-r", "--remotes", "-v", "-vv", "--verbose",
+    "-l", "--list", "--show-current", "--contains", "--no-contains",
+    "--merged", "--no-merged", "--points-at", "--sort", "--format",
+    "--color", "--no-color", "--column", "--no-column",
+    "-i", "--ignore-case", "--abbrev", "--no-abbrev",
+})
+
 
 @dataclass(frozen=True)
 class ApprovalPolicy:
@@ -190,20 +211,53 @@ class ApprovalPolicy:
 
     @staticmethod
     def _is_git_readonly(name: str, args: dict) -> bool:
-        """Return ``True`` when ``name='git'`` and the op is a read-only one.
+        """Return ``True`` when ``name='git'`` and the call is side-effect-free.
 
-        Gating is decided by an explicit read-only allowlist
-        (``status``/``diff``/``log``/``show``/``branch``). Every other
-        operation — the mutating ones (``add``/``commit``/``checkout``/
-        ``stash``) and any unrecognized/future op (``push``/``reset``/
-        ``clean``) — is treated as needing approval, so the policy fails
-        closed rather than open.
+        Gating is decided by an explicit read-only allowlist of operations
+        (``status``/``diff``/``log``/``show``/``branch``) *and* an inspection of
+        the operation's extra ``args``: a read-only op still counts as read-only
+        only when its arguments introduce no side effects. Specifically:
+
+        * an output-redirection flag (``-o``/``--output``) writes a file, so any
+          op carrying one is treated as mutating; and
+        * ``branch`` is read-only only when every argument is a known listing
+          flag — a positional argument (creates a branch) or a mutating flag
+          (``-d``/``-D``/``-m``/``-f``/``--set-upstream-to`` …) makes it mutating.
+
+        Every other operation — the mutating ones (``add``/``commit``/
+        ``checkout``/``stash``) and any unrecognized/future op (``push``/
+        ``reset``/``clean``) — is treated as needing approval, so the policy
+        fails closed rather than open.
         """
 
         if name != "git":
             return False
         op = args.get("operation")
-        return isinstance(op, str) and op in _GIT_READONLY
+        if not (isinstance(op, str) and op in _GIT_READONLY):
+            return False
+        extra = args.get("args")
+        tokens = [t for t in extra if isinstance(t, str)] if isinstance(extra, list) else []
+        return ApprovalPolicy._git_args_side_effect_free(op, tokens)
+
+    @staticmethod
+    def _git_args_side_effect_free(op: str, tokens: list[str]) -> bool:
+        """Return ``True`` when ``tokens`` keep a read-only git ``op`` read-only.
+
+        Fails closed: an output-redirection flag on any op, or (for ``branch``)
+        any argument outside :data:`_GIT_BRANCH_READONLY_FLAGS`, marks the call
+        as having side effects so it is no longer auto-classified read-only.
+        """
+
+        for tok in tokens:
+            base = tok.split("=", 1)[0]
+            if base in _GIT_FILE_OUTPUT_FLAGS:
+                return False
+        if op == "branch":
+            for tok in tokens:
+                base = tok.split("=", 1)[0]
+                if base not in _GIT_BRANCH_READONLY_FLAGS:
+                    return False
+        return True
 
 
 @runtime_checkable

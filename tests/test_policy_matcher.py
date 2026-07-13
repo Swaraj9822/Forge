@@ -218,6 +218,90 @@ def test_supervised_mode_requires_approval_for_mutating_git(op: str) -> None:
     ) is True
 
 
+@pytest.mark.parametrize(
+    "args",
+    [
+        ["-D", "main"],       # force-delete a branch
+        ["-d", "feature"],    # delete a branch
+        ["-m", "old", "new"], # rename a branch
+        ["-M", "old", "new"], # force-rename a branch
+        ["-c", "a", "b"],     # copy a branch
+        ["-f", "topic", "HEAD"],  # force-move a branch
+        ["--set-upstream-to=origin/main"],
+        ["newbranch"],        # bare positional creates a branch
+    ],
+)
+def test_supervised_mode_gates_destructive_branch_args(args: list) -> None:
+    """A read-only op name (``branch``) carrying mutating args is not read-only.
+
+    Regression: ``git branch -D main`` must require approval in supervised mode
+    rather than being waved through as read-only on the op name alone.
+    """
+    policy = ApprovalPolicy(
+        mode=AutonomyMode.SUPERVISED,
+        shell=ShellMatcher(allowlist=()),
+    )
+    assert policy.requires_approval(
+        "git", {"operation": "branch", "args": args}, read_only=False
+    ) is True
+
+
+@pytest.mark.parametrize(
+    "args",
+    [
+        [],
+        ["-a"],
+        ["--all"],
+        ["-v", "-a"],
+        ["--list"],
+        ["--show-current"],
+        ["--sort=-committerdate"],
+    ],
+)
+def test_supervised_mode_allows_listing_branch_args(args: list) -> None:
+    """``git branch`` with only listing flags stays read-only (no prompt)."""
+    policy = ApprovalPolicy(
+        mode=AutonomyMode.SUPERVISED,
+        shell=ShellMatcher(allowlist=()),
+    )
+    assert policy.requires_approval(
+        "git", {"operation": "branch", "args": args}, read_only=False
+    ) is False
+
+
+@pytest.mark.parametrize("op", ["diff", "show", "log", "status"])
+@pytest.mark.parametrize("flag", ["-o", "--output", "--output=/tmp/x"])
+def test_supervised_mode_gates_output_redirection(op: str, flag: str) -> None:
+    """An output-redirection flag writes a file, so it is not read-only.
+
+    Regression: ``git diff --output=FILE`` must require approval rather than
+    being auto-classified read-only.
+    """
+    policy = ApprovalPolicy(
+        mode=AutonomyMode.SUPERVISED,
+        shell=ShellMatcher(allowlist=()),
+    )
+    args = [flag, "/tmp/x"] if flag in ("-o", "--output") else [flag]
+    assert policy.requires_approval(
+        "git", {"operation": op, "args": args}, read_only=False
+    ) is True
+
+
+def test_readonly_mode_forbids_destructive_branch_args() -> None:
+    """READONLY forbids ``git branch -D`` outright (it is not read-only)."""
+    policy = ApprovalPolicy(
+        mode=AutonomyMode.READONLY,
+        shell=ShellMatcher(allowlist=()),
+    )
+    assert policy.is_forbidden(
+        "git", {"operation": "branch", "args": ["-D", "main"]}, read_only=False
+    ) is True
+    # A plain branch listing is still allowed.
+    assert policy.is_forbidden(
+        "git", {"operation": "branch", "args": ["-a"]}, read_only=False
+    ) is False
+
+
 def test_readonly_mode_forbids_mutations_without_prompt() -> None:
     policy = ApprovalPolicy(
         mode=AutonomyMode.READONLY,
