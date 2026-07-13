@@ -21,3 +21,29 @@ Run the test suite:
 ```
 pytest
 ```
+
+## Non-interactive mode
+
+Forge supports a headless, scriptable mode via `forge -p "<prompt>"`:
+
+```
+forge -p "list the python files in this repo" --output json
+```
+
+Use `--output text` (default) for streamed plain text or `--output json` for a
+single parseable JSON object. Pass `-p -` to read the prompt from stdin.
+
+**Phase 2 — safe by default.** Headless runs respect the approval policy
+configured under `[policy]` (`autopilot`, `supervised`, or `readonly`). Without
+`--yes`, a `supervised` or `readonly` run refuses any gated mutation (returns a
+denied/forbidden tool result) rather than hanging on a prompt that cannot be
+answered. Pass `--yes` to auto-approve every gated call, matching the autopilot
+behavior:
+
+```
+# Refuses write/edit/shell unless they are in the allowlist (or you pass --yes)
+forge -p "summarize README.md" --output json
+
+# Auto-approve everything (CI / trusted environments)
+forge -p "run the tests and fix failures" --output json --yes
+```

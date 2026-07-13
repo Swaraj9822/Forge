@@ -66,3 +66,47 @@ def test_single_oversized_message_is_truncated():
 
     max_allowed_chars = SUMMARY_INPUT_TOKEN_BUDGET * CHARS_PER_TOKEN + 5_000
     assert max(client.request_char_sizes) <= max_allowed_chars
+
+
+class _FailingClient:
+    """VertexClient-like stub whose stream raises, simulating a VertexError."""
+
+    def generate_stream(self, contents, tools):
+        raise RuntimeError("simulated vertex failure")
+        yield  # pragma: no cover - unreachable, makes this a generator
+
+
+def test_summarization_failure_falls_back_to_local_summary(recwarn):
+    """A raising summarizer must not crash compaction; it degrades to local."""
+    cm = ContextManager(Config(), summarizer=_FailingClient())
+    middle = [_big_message(i) for i in range(3)]
+
+    # Must not raise, despite the summarizer failing.
+    summary = cm._summarize_middle(middle)
+
+    assert isinstance(summary, str) and summary
+    assert "summarized locally" in summary
+    assert any(
+        "summarization failed" in str(w.message).lower() for w in recwarn.list
+    )
+
+
+def test_compact_survives_summarizer_failure():
+    """End-to-end: compact() completes even when the summarizer raises."""
+    # Tiny limit + many messages forces a middle region to summarize.
+    config = Config(token_limit=100, retained_recent_messages=0)
+    cm = ContextManager(config, summarizer=_FailingClient())
+
+    from forge.session import Message, Session
+
+    messages = [Message("user", "task")]
+    messages.extend(Message("model", "z" * 400) for _ in range(8))
+    session = Session(
+        id="s", created_at="t", updated_at="t", messages=messages
+    )
+
+    # Must not raise; a compacted window is produced.
+    result = cm.compact(session)
+
+    assert result.info.occurred is True
+    assert result.messages

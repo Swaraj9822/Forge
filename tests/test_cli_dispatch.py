@@ -273,3 +273,76 @@ def test_resume_corrupt_session_errors_and_leaves_bytes_untouched(
         assert corrupt_path.read_bytes() == before == corrupt_bytes
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+# --------------------------------------------------------------------------- #
+# forge -p / --prompt (Feature A)
+# --------------------------------------------------------------------------- #
+
+
+def test_headless_prompt_dispatches_to_run_prompt(monkeypatch) -> None:
+    """``forge -p <prompt>`` routes into app.run_prompt and returns its code."""
+    calls: list[tuple] = []
+
+    def fake_run_prompt(prompt, *, output="text", config_path=None, workspace_root=None, out=None, err=None, yes=False):
+        calls.append((prompt, output))
+        return 42
+
+    monkeypatch.setattr(cli, "run_prompt", fake_run_prompt)
+
+    code, out, err = _run(["-p", "hello world"])
+
+    assert code == 42
+    assert calls == [("hello world", "text")]
+    assert err == ""
+
+
+def test_headless_stdin_prompt_reads_stdin(monkeypatch) -> None:
+    """``forge -p -`` reads the prompt from stdin."""
+    monkeypatch.setattr(cli.sys, "stdin", StringIO("prompt from stdin"))
+
+    calls: list[str] = []
+
+    def fake_run_prompt(prompt, **kwargs):
+        calls.append(prompt)
+        return 0
+
+    monkeypatch.setattr(cli, "run_prompt", fake_run_prompt)
+
+    code, _out, _err = _run(["-p", "-"])
+
+    assert code == 0
+    assert calls == ["prompt from stdin"]
+
+
+def test_blank_prompt_returns_one_without_dispatch(monkeypatch) -> None:
+    """A whitespace-only prompt exits 1 with an error and never calls run_prompt."""
+    calls: list = []
+
+    def fake_run_prompt(*args, **kwargs):  # pragma: no cover
+        calls.append((args, kwargs))
+        return 0
+
+    monkeypatch.setattr(cli, "run_prompt", fake_run_prompt)
+
+    code, out, err = _run(["-p", "   "])
+
+    assert code == 1
+    assert "Empty prompt" in err
+    assert calls == []
+
+
+def test_headless_output_json_threaded(monkeypatch) -> None:
+    """``--output json`` is forwarded to run_prompt."""
+    calls: list[tuple] = []
+
+    def fake_run_prompt(prompt, *, output="text", **kwargs):
+        calls.append((prompt, output))
+        return 0
+
+    monkeypatch.setattr(cli, "run_prompt", fake_run_prompt)
+
+    code, _out, _err = _run(["-p", "do it", "--output", "json"])
+
+    assert code == 0
+    assert calls == [("do it", "json")]

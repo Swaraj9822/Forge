@@ -44,10 +44,14 @@ exactly once per change regardless of which path observed it.
 from __future__ import annotations
 
 import sys
-from typing import TYPE_CHECKING, Callable, Protocol, TextIO
+from pathlib import Path
+from typing import TYPE_CHECKING, Any, Callable, Protocol, TextIO
+
+from forge.ui import Ui
 
 from forge.agent import AgentLoop, TurnResult
 from forge.context import CompactionInfo
+from forge.policy import Decision
 from forge.session import Session, TodoItem
 from forge.usage import UsageSummary
 
@@ -57,6 +61,7 @@ if TYPE_CHECKING:  # pragma: no cover - imported only for type checking
     # from ``forge.agent`` (as this module does) but not from ``forge.repl``, so
     # no real cycle exists; guarding the import keeps the coupling annotation-only
     # and avoids any ordering fragility during bootstrap.
+    from forge.checkpoint import CheckpointStore
     from forge.verification import (
         VerificationCoordinator,
         VerificationRenderer,
@@ -68,6 +73,9 @@ __all__ = ["Repl", "is_exit_command", "is_blank", "PROMPT"]
 #: The reserved keywords that terminate the REPL (the Exit_Command set).
 EXIT_COMMANDS: frozenset[str] = frozenset({"/exit", "/quit"})
 
+#: The reserved keyword that triggers a checkpoint undo (Phase 2, Feature C).
+UNDO_COMMAND: str = "/undo"
+
 #: The prompt string shown while waiting for user input (Req 1.1).
 PROMPT: str = "forge> "
 
@@ -77,6 +85,11 @@ _TODO_STATUS_GLYPHS: dict[str, str] = {
     "in_progress": "[~]",
     "completed": "[x]",
 }
+
+#: Approver prompt responses (Phase 2, Feature B).
+_APPROVE_RESPONSES: frozenset[str] = frozenset({"y", "yes"})
+_DENY_RESPONSES: frozenset[str] = frozenset({"n", "no"})
+_ALWAYS_RESPONSES: frozenset[str] = frozenset({"a", "always"})
 
 
 # --------------------------------------------------------------------------- #
@@ -106,6 +119,53 @@ def is_blank(text: str) -> bool:
     """
 
     return text.strip() == ""
+
+
+def _approval_target(name: str, args: dict) -> str:
+    """Return the per-call target key used by the APPROVE_ALWAYS memory.
+
+    The key normalizes a tool call down to the smallest identifier that
+    distinguishes two meaningful variants of the same tool: ``shell`` uses
+    its argv[0] (so ``pytest`` and ``pytest -q`` share an ``always`` answer
+    when the user said ``a``); ``git`` uses the ``operation``; ``write`` /
+    ``edit`` use the ``path``; everything else uses the whole arg dump.
+    """
+
+    if not isinstance(args, dict):
+        return ""
+    if name == "shell":
+        cmd = args.get("command")
+        if isinstance(cmd, str):
+            stripped = cmd.lstrip()
+            if stripped:
+                # Use the first whitespace-delimited token of the command.
+                return stripped.split(None, 1)[0]
+        return ""
+    if name == "git":
+        op = args.get("operation")
+        if isinstance(op, str):
+            return op
+        return ""
+    if name in ("write", "edit"):
+        path = args.get("path")
+        if isinstance(path, str):
+            return path
+        return ""
+    return repr(args)
+
+
+def _summarize_args(args: dict) -> str:
+    """Render ``args`` as a short, human-readable summary line for prompts."""
+
+    if not isinstance(args, dict) or not args:
+        return "(no arguments)"
+    parts: list[str] = []
+    for key, value in args.items():
+        rendered = value if isinstance(value, str) else repr(value)
+        if len(rendered) > 80:
+            rendered = rendered[:77] + "..."
+        parts.append(f"{key}={rendered}")
+    return ", ".join(parts)
 
 
 # --------------------------------------------------------------------------- #
@@ -192,6 +252,13 @@ class Repl:
         out: TextIO | None = None,
         prompt: str = PROMPT,
         verification_coordinator: "VerificationCoordinator | None" = None,
+        checkpoint: "CheckpointStore | None" = None,
+        show_diffs: bool = False,
+        ui: Ui | None = None,
+        commands_store: Any | None = None,
+        mentions_enabled: bool = False,
+        read_max_bytes: int = 1_000_000,
+        workspace_root: Path | None = None,
     ) -> None:
         self.agent_loop = agent_loop
         self.session = session
@@ -199,6 +266,17 @@ class Repl:
         self.out: TextIO = out if out is not None else sys.stdout
         self.prompt = prompt
         self.verification_coordinator = verification_coordinator
+        self.checkpoint = checkpoint
+        self.show_diffs = bool(show_diffs)
+        self.ui = ui or Ui(self.out, color=False, spinner=False)
+        self.commands_store = commands_store
+        self.mentions_enabled = bool(mentions_enabled)
+        self.read_max_bytes = int(read_max_bytes)
+        self.workspace_root = workspace_root if workspace_root is not None else Path.cwd()
+        # Session-scoped set of tool+target keys the user has answered
+        # ``a`` (always-approve) for in this REPL session. APPROVE_ALWAYS
+        # bookkeeping lives here, not in the executor, per the design.
+        self._always_approve: set[tuple[str, str]] = set()
 
         # Install this Repl as the loop's renderer so its on_text/on_tool/
         # on_compaction hooks are driven during a turn. Respect an explicitly
@@ -272,8 +350,54 @@ class Repl:
 
         if is_exit_command(line):
             return False
+        if line == UNDO_COMMAND:
+            self._handle_undo()
+            return True
+
+        if line == "/help" or line == "/commands":
+            builtins = ["/exit", "/quit", "/undo", "/help", "/commands"]
+            customs = []
+            if self.commands_store is not None:
+                customs = self.commands_store.names()
+            self._writeln("Built-in commands:")
+            self._writeln("  " + ", ".join(builtins))
+            if customs:
+                self._writeln("Custom commands:")
+                self._writeln("  " + ", ".join(f"/{c}" for c in customs))
+            return True
+
+        if line.startswith("/"):
+            parts = line.split(None, 1)
+            cmd_name = parts[0][1:]
+            arg_text = parts[1] if len(parts) > 1 else ""
+
+            is_custom = False
+            if self.commands_store is not None:
+                is_custom = cmd_name in self.commands_store.names()
+
+            if is_custom:
+                rendered = self.commands_store.render(cmd_name, arg_text)
+                if rendered is not None:
+                    line = rendered
+                else:
+                    self._writeln(f"Error rendering command '/{cmd_name}'")
+                    return True
+            else:
+                self._writeln(f"Unknown command: {parts[0]}")
+                return True
+
         if is_blank(line):
             return True
+
+        if self.mentions_enabled:
+            from forge.commands import expand_mentions
+            line, included, warnings = expand_mentions(
+                line, self.workspace_root, max_bytes=self.read_max_bytes
+            )
+            if included:
+                self._writeln(f"[included: {', '.join(included)}]")
+            for warning in warnings:
+                self._writeln(f"[warning] {warning}")
 
         result = self.agent_loop.run_turn(self.session, line)
 
@@ -302,7 +426,29 @@ class Repl:
     def on_tool(self, name: str) -> None:
         """Announce the tool about to run, before it executes (Req 3.2)."""
 
-        self._writeln(f"\n[tool: {name}]")
+        announcement = self.ui.tool_announcement(name)
+        self._writeln(announcement)
+
+    def on_tool_result(self, name: str, denied: bool, forbidden: bool,
+                       diff: str | None) -> None:
+        """Render a post-execution notice for a single tool result (Phase 2).
+
+        Called by the :class:`~forge.agent.AgentLoop` after each tool result is
+        appended to the session. Used to surface denial / forbiddance (the
+        approval policy refused the call) and — when ``show_diffs`` is enabled
+        — the unified diff for a successful write/edit.
+        """
+
+        if denied:
+            self._writeln(f"[denied] {name}")
+        elif forbidden:
+            self._writeln(f"[forbidden] {name}")
+        if diff and self.show_diffs:
+            self.ui.render_diff(diff)
+
+    def status(self, message: str):
+        """Return a status context manager via the UI helper."""
+        return self.ui.status(message)
 
     def on_compaction(self, info: CompactionInfo) -> None:
         """Render the "conversation context was compacted" notice (Req 14.7)."""
@@ -318,6 +464,57 @@ class Repl:
         """
 
         self._render_todos_if_changed(todos)
+
+    # -- Approver / undo (Phase 2) ------------------------------------------
+
+    def request(self, name: str, args: dict, preview: str | None) -> Decision:
+        """Prompt the user to approve a gated tool call (Phase 2, Feature B).
+
+        Prints a summary line, the preview (when present), then a short prompt
+        reading a single line of input. Recognized responses:
+
+        * ``y`` / ``yes`` -> :attr:`Decision.APPROVE`
+        * ``a`` / ``always`` -> :attr:`Decision.APPROVE_ALWAYS` (recorded for
+          the session so the same action is not re-prompted)
+        * anything else (including ``n`` / ``no`` and blank) -> :attr:`Decision.DENY`
+        """
+
+        target = _approval_target(name, args)
+        if (name, target) in self._always_approve:
+            return Decision.APPROVE_ALWAYS
+
+        summary = _summarize_args(args)
+        self._writeln(f"[approve] {name} wants to run: {summary}")
+        if preview:
+            for line in preview.rstrip("\n").splitlines():
+                self._writeln(f"    {line}")
+        self._write("[y/n/a] ")
+
+        response = self._read_input().strip().lower()
+        if response in _ALWAYS_RESPONSES:
+            self._always_approve.add((name, target))
+            return Decision.APPROVE_ALWAYS
+        if response in _APPROVE_RESPONSES:
+            return Decision.APPROVE
+        return Decision.DENY
+
+    def _handle_undo(self) -> None:
+        """Undo the most recent committed turn (Phase 2, Feature C).
+
+        Prints ``[undo] restored N file(s): …`` on success, or
+        ``[undo] nothing to undo`` when there is no committed checkpoint group.
+        A checkpoint store must be wired for the command to do anything.
+        """
+
+        if self.checkpoint is None:
+            self._writeln("[undo] nothing to undo")
+            return
+        restored = self.checkpoint.undo_last()
+        if not restored:
+            self._writeln("[undo] nothing to undo")
+            return
+        joined = ", ".join(restored)
+        self._writeln(f"[undo] restored {len(restored)} file(s): {joined}")
 
     # -- VerificationRenderer hooks (driven by the coordinator) --------------
 

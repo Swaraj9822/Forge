@@ -227,6 +227,7 @@ class ShellTool:
         "default shell (cmd.exe on Windows, /bin/sh on Unix). Long-running "
         "commands are terminated after a timeout; large output is truncated."
     )
+    read_only = False
     parameters: dict = {
         "type": "object",
         "properties": {

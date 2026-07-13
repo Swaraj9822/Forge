@@ -37,9 +37,15 @@ RECOGNIZED_TOOLS: tuple[str, ...] = (
     "search",
     "git",
     "planning",
+    # Phase 3: memory and repo index tools
+    "remember",
+    "search_memory",
+    "repo_index",
+    # Phase 5: subagents delegation
+    "delegate",
 )
 
-DEFAULT_ENABLED_TOOLS: list[str] = list(RECOGNIZED_TOOLS)
+DEFAULT_ENABLED_TOOLS: list[str] = [t for t in RECOGNIZED_TOOLS if t != "delegate"]
 
 # Documented numeric limits, grouped under the [limits] TOML table.
 DEFAULT_LIMITS: dict[str, int] = {
@@ -185,6 +191,55 @@ def resolve_verification_config(
     )
 
 
+# Allowed values for the Phase 2 ``[policy]`` table's ``mode`` field.
+POLICY_MODES: tuple[str, ...] = ("autopilot", "supervised", "readonly")
+
+
+def resolve_policy_config(raw: dict[str, Any] | None) -> tuple[str, tuple[str, ...], bool]:
+    """Resolve a ``[policy]`` mapping into ``(mode, allowlist, show_diffs)``.
+
+    Pure: applies the documented defaults for absent values and validates
+    ``mode``, raising :class:`ConfigError` (naming the offending value) for
+    an unknown mode. ``shell_allowlist`` is normalized to a tuple of strings;
+    non-string entries are silently dropped (an empty allowlist is valid and
+    disables auto-approval for every shell command in supervised mode).
+    """
+
+    raw = raw or {}
+
+    if "mode" in raw:
+        mode = raw["mode"]
+        if mode not in POLICY_MODES:
+            allowed = ", ".join(POLICY_MODES)
+            raise ConfigError(
+                ConfigManager.config_path(),
+                detail=(
+                    f"policy.mode must be one of {{{allowed}}}, got {mode!r}"
+                ),
+            )
+    else:
+        mode = "autopilot"
+
+    allowlist_raw = raw.get("shell_allowlist", [])
+    if allowlist_raw is None:
+        allowlist_raw = []
+    if not isinstance(allowlist_raw, list):
+        raise ConfigError(
+            ConfigManager.config_path(),
+            detail=(
+                "policy.shell_allowlist must be a list of strings, got "
+                f"{type(allowlist_raw).__name__}"
+            ),
+        )
+    allowlist: list[str] = []
+    for item in allowlist_raw:
+        if isinstance(item, str):
+            allowlist.append(item)
+    show_diffs = bool(raw.get("show_diffs", False))
+
+    return mode, tuple(allowlist), show_diffs
+
+
 @dataclass(frozen=True)
 class McpServerConfig:
     """Configuration for a single MCP server launched as a subprocess."""
@@ -218,6 +273,43 @@ class Config:
     mcp_servers: list[McpServerConfig] = field(default_factory=list)
     pricing: ModelPricing = field(default_factory=lambda: ModelPricing(None, None))
     verification: VerificationConfig = field(default_factory=VerificationConfig)
+    plan_reminder: bool = True
+    project_memory: bool = True
+    # Phase 2: autonomy / approval policy + checkpoint store.
+    # The dataclass default is ``autopilot`` so an absent ``[policy]`` table
+    # reproduces today's behavior and existing tests pass. A freshly
+    # ``forge init``-ed config opts the user into ``supervised`` via
+    # ``write_default`` below.
+    policy_mode: str = "autopilot"
+    shell_allowlist: tuple[str, ...] = ()
+    show_diffs: bool = False
+    checkpoint_enabled: bool = True
+    checkpoint_keep_turns: int = 10
+    # Phase 3: memory and repo map configuration.
+    # Providers default OFF so absent tables reproduce today's context byte-for-byte.
+    # Fresh configs opt into enabled=True via write_default.
+    memory_enabled: bool = False
+    memory_max_records: int = 500
+    memory_inject_limit: int = 5
+    memory_inject_char_budget: int = 2000
+    repo_map_enabled: bool = False
+    repo_map_inject: bool = False
+    repo_map_char_budget: int = 4000
+    # Phase 4: Ergonomics & UX configuration
+    ui_color: bool = False
+    ui_spinner: bool = False
+    commands_dir: str = ".forge/commands"
+    parallel_enabled: bool = False
+    parallel_max_workers: int = 4
+    mentions_enabled: bool = False
+    # Phase 5: Multi-provider & Subagents
+    provider_type: str = "vertex"
+    provider_api_key_env: str | None = None
+    provider_base_url: str | None = None
+    subagents_enabled: bool = False
+    subagents_default_tools: list[str] = field(default_factory=lambda: ["read", "search", "repo_index", "search_memory"])
+    subagents_max_turns: int = 4
+
 
 
 def _is_windows() -> bool:
@@ -309,12 +401,49 @@ class ConfigManager:
 
         limits = raw.get("limits") or {}
         pricing_raw = raw.get("pricing") or {}
+        context_raw = raw.get("context") or {}
 
         merged_limits = {
             key: limits.get(key, default) for key, default in DEFAULT_LIMITS.items()
         }
 
-        enabled_tools = self._resolve_enabled_tools(raw.get("enabled_tools"))
+        plan_reminder = bool(context_raw.get("plan_reminder", True))
+        project_memory = bool(context_raw.get("project_memory", True))
+
+        # Phase 5: provider and subagents config
+        provider_raw = raw.get("provider") or {}
+        provider_type = str(provider_raw.get("type", "vertex")).strip()
+        if provider_type not in ("vertex", "anthropic", "openai"):
+            raise ConfigError(
+                ConfigManager.config_path(),
+                detail=f"provider.type must be one of {{vertex, anthropic, openai}}, got {provider_type!r}",
+            )
+        
+        provider_api_key_env = provider_raw.get("api_key_env")
+        provider_base_url = provider_raw.get("base_url")
+
+        subagents_raw = raw.get("subagents") or {}
+        subagents_enabled = bool(subagents_raw.get("enabled", False))
+        subagents_max_turns = subagents_raw.get("max_turns", 4)
+        if (
+            isinstance(subagents_max_turns, bool)
+            or not isinstance(subagents_max_turns, int)
+            or subagents_max_turns < 1
+        ):
+            raise ConfigError(
+                ConfigManager.config_path(),
+                detail=f"subagents.max_turns must be an integer >= 1, got {subagents_max_turns!r}",
+            )
+
+        subagents_default_tools = list(subagents_raw.get("default_tools", ["read", "search", "repo_index", "search_memory"]))
+        for tool_name in subagents_default_tools:
+            if tool_name not in RECOGNIZED_TOOLS:
+                raise ConfigError(
+                    ConfigManager.config_path(),
+                    detail=f"subagents.default_tools contains unrecognized tool {tool_name!r}",
+                )
+
+        enabled_tools = self._resolve_enabled_tools(raw.get("enabled_tools"), subagents_enabled)
         steering_files = list(raw.get("steering_files", []))
         mcp_servers = self._parse_mcp_servers(raw.get("mcp_servers", []))
         pricing = ModelPricing(
@@ -328,27 +457,171 @@ class ConfigManager:
             output_cap_chars=merged_limits["output_cap_chars"],
         )
 
+        policy_mode, shell_allowlist, show_diffs = resolve_policy_config(
+            raw.get("policy")
+        )
+
+        checkpoint_raw = raw.get("checkpoint") or {}
+        checkpoint_enabled = bool(checkpoint_raw.get("enabled", True))
+        checkpoint_keep = checkpoint_raw.get("keep_turns", 10)
+        if (
+            isinstance(checkpoint_keep, bool)
+            or not isinstance(checkpoint_keep, int)
+            or checkpoint_keep < 0
+        ):
+            raise ConfigError(
+                ConfigManager.config_path(),
+                detail=(
+                    "checkpoint.keep_turns must be an integer >= 0, got "
+                    f"{checkpoint_keep!r}"
+                ),
+            )
+
+        # Phase 3: memory and repo map configuration
+        memory_raw = raw.get("memory") or {}
+        memory_enabled = bool(memory_raw.get("enabled", False))
+        memory_max_records = memory_raw.get("max_records", 500)
+        if (
+            isinstance(memory_max_records, bool)
+            or not isinstance(memory_max_records, int)
+            or memory_max_records < 1
+        ):
+            raise ConfigError(
+                ConfigManager.config_path(),
+                detail=(
+                    "memory.max_records must be an integer >= 1, got "
+                    f"{memory_max_records!r}"
+                ),
+            )
+        memory_inject_limit = memory_raw.get("inject_limit", 5)
+        if (
+            isinstance(memory_inject_limit, bool)
+            or not isinstance(memory_inject_limit, int)
+            or memory_inject_limit < 1
+        ):
+            raise ConfigError(
+                ConfigManager.config_path(),
+                detail=(
+                    "memory.inject_limit must be an integer >= 1, got "
+                    f"{memory_inject_limit!r}"
+                ),
+            )
+        memory_inject_char_budget = memory_raw.get("inject_char_budget", 2000)
+        if (
+            isinstance(memory_inject_char_budget, bool)
+            or not isinstance(memory_inject_char_budget, int)
+            or memory_inject_char_budget < 100
+        ):
+            raise ConfigError(
+                ConfigManager.config_path(),
+                detail=(
+                    "memory.inject_char_budget must be an integer >= 100, got "
+                    f"{memory_inject_char_budget!r}"
+                ),
+            )
+
+        repo_map_raw = raw.get("repo_map") or {}
+        repo_map_enabled = bool(repo_map_raw.get("enabled", False))
+        repo_map_inject = bool(repo_map_raw.get("inject", False))
+        repo_map_char_budget = repo_map_raw.get("char_budget", 4000)
+        if (
+            isinstance(repo_map_char_budget, bool)
+            or not isinstance(repo_map_char_budget, int)
+            or repo_map_char_budget < 100
+        ):
+            raise ConfigError(
+                ConfigManager.config_path(),
+                detail=(
+                    "repo_map.char_budget must be an integer >= 100, got "
+                    f"{repo_map_char_budget!r}"
+                ),
+            )
+
+        ui_raw = raw.get("ui") or {}
+        ui_color = bool(ui_raw.get("color", False))
+        ui_spinner = bool(ui_raw.get("spinner", False))
+
+        commands_raw = raw.get("commands") or {}
+        commands_dir = str(commands_raw.get("dir", ".forge/commands"))
+
+        parallel_raw = raw.get("parallel") or {}
+        parallel_enabled = bool(parallel_raw.get("enabled", False))
+        parallel_max_workers = parallel_raw.get("max_workers", 4)
+        if (
+            isinstance(parallel_max_workers, bool)
+            or not isinstance(parallel_max_workers, int)
+            or parallel_max_workers < 1
+        ):
+            raise ConfigError(
+                ConfigManager.config_path(),
+                detail=(
+                    "parallel.max_workers must be an integer >= 1, got "
+                    f"{parallel_max_workers!r}"
+                ),
+            )
+
+        mentions_raw = raw.get("mentions") or {}
+        mentions_enabled = bool(mentions_raw.get("enabled", False))
+
+        model_resolved = provider_raw.get("model") or raw.get("model") or DEFAULT_MODEL
+        project_resolved = provider_raw.get("project") or raw.get("project")
+        region_resolved = provider_raw.get("region") or raw.get("region")
+
         return Config(
-            model=raw.get("model", DEFAULT_MODEL),
-            project=raw.get("project"),
-            region=raw.get("region"),
+            model=model_resolved,
+            project=project_resolved,
+            region=region_resolved,
             enabled_tools=enabled_tools,
             steering_files=steering_files,
             mcp_servers=mcp_servers,
             pricing=pricing,
             verification=verification,
+            plan_reminder=plan_reminder,
+            project_memory=project_memory,
+            policy_mode=policy_mode,
+            shell_allowlist=shell_allowlist,
+            show_diffs=show_diffs,
+            checkpoint_enabled=checkpoint_enabled,
+            checkpoint_keep_turns=checkpoint_keep,
+            memory_enabled=memory_enabled,
+            memory_max_records=memory_max_records,
+            memory_inject_limit=memory_inject_limit,
+            memory_inject_char_budget=memory_inject_char_budget,
+            repo_map_enabled=repo_map_enabled,
+            repo_map_inject=repo_map_inject,
+            repo_map_char_budget=repo_map_char_budget,
+            ui_color=ui_color,
+            ui_spinner=ui_spinner,
+            commands_dir=commands_dir,
+            parallel_enabled=parallel_enabled,
+            parallel_max_workers=parallel_max_workers,
+            mentions_enabled=mentions_enabled,
+            provider_type=provider_type,
+            provider_api_key_env=provider_api_key_env,
+            provider_base_url=provider_base_url,
+            subagents_enabled=subagents_enabled,
+            subagents_default_tools=subagents_default_tools,
+            subagents_max_turns=subagents_max_turns,
             **merged_limits,
         )
 
     @staticmethod
-    def _resolve_enabled_tools(value: Any) -> list[str]:
+    def _resolve_enabled_tools(value: Any, subagents_enabled: bool = False) -> list[str]:
         """Apply default when absent; drop+warn unrecognized tools (Req 11.7)."""
 
         if value is None:
-            return list(DEFAULT_ENABLED_TOOLS)
+            tools = list(DEFAULT_ENABLED_TOOLS)
+            if subagents_enabled and "delegate" not in tools:
+                tools.append("delegate")
+            return tools
 
         recognized: list[str] = []
         for name in value:
+            # ``delegate`` is a recognized tool (it is in RECOGNIZED_TOOLS); it
+            # is simply absent from DEFAULT_ENABLED_TOOLS so it stays off unless
+            # explicitly listed or auto-added when subagents are enabled. It is
+            # therefore resolved like any other recognized tool here — the
+            # recognized-tools invariant (Property 18) must hold for it too.
             if name in RECOGNIZED_TOOLS:
                 recognized.append(name)
             else:
@@ -395,6 +668,59 @@ class ConfigManager:
             # connected at every startup; the placeholder example used to fail
             # to launch and warn on a fresh config. Add real servers by hand.
             "mcp_servers": [],
+            "context": {"plan_reminder": True, "project_memory": True},
+            # Phase 2: opt fresh configs into supervised mode (safe default)
+            # and seed a small starter shell allowlist so trivial commands run
+            # without a prompt. The dataclass default remains ``autopilot`` so
+            # an absent ``[policy]`` table reproduces today's behavior.
+            "policy": {
+                "mode": "supervised",
+                "shell_allowlist": [
+                    "pytest",
+                    "git",
+                    "ls",
+                    "cat",
+                    "python -m pytest",
+                ],
+                "show_diffs": True,
+            },
+            "checkpoint": {"enabled": True, "keep_turns": 10},
+            # Phase 3: opt fresh configs into memory and repo map features
+            "memory": {
+                "enabled": True,
+                "max_records": 500,
+                "inject_limit": 5,
+                "inject_char_budget": 2000,
+            },
+            "repo_map": {
+                "enabled": True,
+                "inject": True,
+                "char_budget": 4000,
+            },
+            # Phase 4: opt fresh configs into color terminal, spinner, mentions
+            "ui": {
+                "color": True,
+                "spinner": True,
+            },
+            "commands": {
+                "dir": ".forge/commands",
+            },
+            "parallel": {
+                "enabled": False,
+                "max_workers": 4,
+            },
+            "mentions": {
+                "enabled": True,
+            },
+            "provider": {
+                "type": "vertex",
+                "model": DEFAULT_MODEL,
+            },
+            "subagents": {
+                "enabled": False,
+                "default_tools": ["read", "search", "repo_index", "search_memory"],
+                "max_turns": 4,
+            },
         }
 
         with open(path, "wb") as fh:

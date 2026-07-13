@@ -42,6 +42,7 @@ from typing import Sequence, TextIO
 
 from forge.app import StartupError
 from forge.app import main as app_main
+from forge.app import run_prompt
 from forge.config import ConfigError, ConfigManager
 from forge.session import (
     CorruptSessionError,
@@ -82,6 +83,26 @@ def build_parser() -> argparse.ArgumentParser:
     resume.add_argument(
         "session_id",
         help="The identifier of the saved session to resume.",
+    )
+
+    parser.add_argument(
+        "-p",
+        "--prompt",
+        help="Run a single prompt non-interactively and exit. Use '-' to read "
+        "the prompt from stdin.",
+    )
+    parser.add_argument(
+        "--output",
+        choices=["text", "json"],
+        default="text",
+        help="Output format for non-interactive runs (default: text).",
+    )
+    parser.add_argument(
+        "--yes",
+        action="store_true",
+        help="Auto-approve every gated tool call in non-interactive runs. "
+        "Without this flag a headless supervised run refuses mutations "
+        "rather than hanging on a prompt it cannot answer (Phase 2).",
     )
 
     return parser
@@ -164,6 +185,32 @@ def _cmd_resume(session_id: str, *, err: TextIO) -> int:
     return _run_repl(session=session, err=err)
 
 
+def _read_prompt_arg(value: str) -> str:
+    """Return the prompt text; '-' means read all of stdin."""
+    if value == "-":
+        return sys.stdin.read()
+    return value
+
+
+def _run_headless(
+    prompt: str,
+    *,
+    output: str,
+    yes: bool,
+    out: TextIO,
+    err: TextIO,
+) -> int:
+    """Route into app.run_prompt, handling the fatal startup errors like _run_repl."""
+    try:
+        return run_prompt(prompt, output=output, out=out, err=err, yes=yes)
+    except ConfigError as exc:
+        print(str(exc), file=err)
+        return 1
+    except StartupError as exc:  # defensive; run_prompt normally handles it
+        print(exc.message, file=err)
+        return exc.exit_code
+
+
 def _run_repl(*, session=None, err: TextIO) -> int:
     """Route into :func:`forge.app.main`, handling the fatal startup errors.
 
@@ -219,6 +266,15 @@ def main(
 
     parser = build_parser()
     args = parser.parse_args(argv)
+
+    if args.command is None and args.prompt is not None:
+        prompt = _read_prompt_arg(args.prompt)
+        if prompt.strip() == "":
+            print("Empty prompt; nothing to do.", file=err)
+            return 1
+        return _run_headless(
+            prompt, output=args.output, yes=args.yes, out=out, err=err
+        )
 
     if args.command == "init":
         return _cmd_init(out=out, err=err)

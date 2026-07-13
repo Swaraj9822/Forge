@@ -46,6 +46,7 @@ from pathlib import Path
 from typing import Any, Protocol, runtime_checkable
 
 from forge.interrupt import InterruptController
+from forge.policy import ApprovalPolicy, Approver, Decision
 from forge.session import ToolCall
 
 __all__ = [
@@ -85,11 +86,16 @@ class Tool(Protocol):
         Natural-language description advertised to the Model.
     parameters:
         JSON schema (a ``dict``) describing the tool's arguments for the Model.
+    read_only:
+        ``True`` when the tool does not affect anything outside the session
+        (the approval policy treats such tools as never-needing-approval).
+        Defaults to ``False``; concrete tools set it explicitly.
     """
 
     name: str
     description: str
     parameters: dict
+    read_only: bool
 
     def validate(self, args: dict) -> str | None:
         """Return ``None`` when ``args`` are valid, else an error string.
@@ -103,6 +109,17 @@ class Tool(Protocol):
         """Execute the tool with validated ``args`` and return a result."""
         ...
 
+    def preview(self, args: dict, ctx: "ToolContext") -> str | None:
+        """Optional: return a best-effort preview of the call's effect.
+
+        Used by the approval system to show the user what a gated call is
+        about to do (e.g. a unified diff for ``write``/``edit``). The default
+        implementation returns ``None``; concrete tools that have something
+        useful to show override it. The executor guards calls with
+        :func:`getattr` so the protocol default is safe to omit.
+        """
+        ...
+
 
 @dataclass
 class ToolContext:
@@ -114,14 +131,20 @@ class ToolContext:
     import cycle with :mod:`forge.config`; it carries config-derived limits
     (timeouts, caps) for tools that need them. ``state`` is a small
     session-scoped bag later tools (e.g. planning) use to retain data across
-    calls within a session. The context is deliberately minimal but
-    extensible.
+    calls within a session. ``memory`` is an optional reference to the
+    :class:`~forge.memory.MemoryStore` for the memory tools (Feature F).
+    The context is deliberately minimal but extensible.
     """
 
     workspace_root: Path
     interrupt: InterruptController
     config: Any | None = None
     state: dict = field(default_factory=dict)
+    memory: Any | None = None
+    provider: Any | None = None
+    tool_registry: dict[str, Any] = field(default_factory=dict)
+    policy: Any | None = None
+    approver: Any | None = None
 
 
 @dataclass(frozen=True)
@@ -158,6 +181,20 @@ class ToolExecutor:
         When omitted a minimal context rooted at the current working directory
         is constructed, which keeps the executor usable in tests and simple
         wiring before the full app context exists.
+    policy:
+        Optional :class:`~forge.policy.ApprovalPolicy` consulted before each
+        call. When ``None`` (the default) no policy gating is applied and the
+        executor behaves exactly as before Phase 2.
+    approver:
+        Optional :class:`~forge.policy.Approver` consulted when the policy
+        requires approval. When ``None`` and a prompt is needed, the call is
+        denied (the safe default for any path that forgot to wire an
+        approver). Auto-approve / deny non-interactive approvers are wired
+        explicitly by the bootstrap / headless paths.
+    checkpoint:
+        Optional :class:`~forge.checkpoint.CheckpointStore` consulted before
+        mutating ``write``/``edit`` calls so a later ``/undo`` can restore the
+        pre-mutation state. When ``None`` no checkpoint is captured.
     """
 
     def __init__(
@@ -166,6 +203,9 @@ class ToolExecutor:
         enabled: set[str],
         interrupt: InterruptController,
         context: ToolContext | None = None,
+        policy: ApprovalPolicy | None = None,
+        approver: Approver | None = None,
+        checkpoint: Any | None = None,
     ) -> None:
         self._registry = registry
         self._enabled = set(enabled)
@@ -173,6 +213,30 @@ class ToolExecutor:
         self._context = context or ToolContext(
             workspace_root=Path.cwd(), interrupt=interrupt
         )
+        self._policy = policy
+        self._approver = approver
+        self._context.approver = approver
+        self._checkpoint = checkpoint
+
+    def set_approver(self, approver: Approver | None) -> None:
+        """Replace the approver (used by bootstrap after the Repl is built).
+
+        The executor is constructed before the Repl (which implements
+        :class:`Approver`) exists, so the bootstrap path wires the approver
+        in afterwards via this setter. Passing ``None`` disables prompting;
+        the executor will deny any call that needs approval.
+        """
+
+        self._approver = approver
+        self._context.approver = approver
+
+    def set_memory(self, memory: Any) -> None:
+        """Set the memory store reference for the memory tools (Phase 3).
+
+        The memory store is constructed during bootstrap and needs to be
+        wired into the tool context so the memory tools can access it.
+        """
+        self._context.memory = memory
 
     # -- exposure ------------------------------------------------------------
 
@@ -246,6 +310,57 @@ class ToolExecutor:
                 meta={"validation_error": True},
             )
 
+        # 3a. Approval-policy gating (Phase 2, Feature B). Side-effect-free:
+        # forbidden / denied results never run the tool or capture a
+        # checkpoint. Read-only tools pass through both checks regardless of
+        # mode.
+        read_only = bool(getattr(tool, "read_only", False))
+        if self._policy is not None:
+            if self._policy.is_forbidden(
+                call.name, call.args, read_only=read_only
+            ):
+                return ToolResult(
+                    ok=False,
+                    content="",
+                    error=(
+                        f"Tool '{call.name}' is forbidden in "
+                        f"{self._policy.mode.value} mode."
+                    ),
+                    meta={"forbidden": True},
+                )
+            if self._policy.requires_approval(
+                call.name, call.args, read_only=read_only
+            ):
+                preview = self._preview(tool, call.args)
+                if self._approver is None:
+                    # No approver wired: safe default is to deny.
+                    decision: Decision = Decision.DENY
+                else:
+                    decision = self._approver.request(
+                        call.name, call.args, preview
+                    )
+                if decision is Decision.DENY:
+                    return ToolResult(
+                        ok=False,
+                        content="",
+                        error=(
+                            f"Tool '{call.name}' was not approved."
+                        ),
+                        meta={"denied": True},
+                    )
+                # APPROVE / APPROVE_ALWAYS both proceed. APPROVE_ALWAYS
+                # bookkeeping (the session-scoped memory) is owned by the
+                # Approver itself; the executor does not track it.
+
+        # 3b. Checkpoint capture (Phase 2, Feature C). Only file-mutating
+        # tools that resolve into the workspace are checkpointed; out-of-scope
+        # paths are silently skipped (the tool will report out-of-scope on its
+        # own and there is nothing to restore).
+        if self._checkpoint is not None and call.name in ("write", "edit"):
+            self._checkpoint.snapshot_before(
+                call.args.get("path"), self._context
+            )
+
         # 4. Run the tool.
         result = tool.run(call.args, self._context)
 
@@ -255,6 +370,25 @@ class ToolExecutor:
 
         # 6. Return the tool's result.
         return result
+
+    def _preview(self, tool: Tool, args: dict) -> str | None:
+        """Compute a best-effort preview via the tool's optional hook.
+
+        A tool that does not implement ``preview``, or whose hook raises, is
+        treated as having no preview (the approver falls back to the args
+        summary). Preview failures must never break a gated call.
+        """
+
+        hook = getattr(tool, "preview", None)
+        if not callable(hook):
+            return None
+        try:
+            value = hook(args, self._context)
+        except Exception:  # noqa: BLE001 - preview must never break a call
+            return None
+        if isinstance(value, str):
+            return value
+        return None
 
     @staticmethod
     def _interrupted_result(name: str) -> ToolResult:

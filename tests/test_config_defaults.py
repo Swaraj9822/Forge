@@ -77,6 +77,15 @@ def partial_configs(draw: st.DrawFn) -> dict:
     if pricing:
         document["pricing"] = pricing
 
+    # Context flags, each independently present or omitted, under [context].
+    context: dict = {}
+    if draw(st.booleans()):
+        context["plan_reminder"] = draw(st.booleans())
+    if draw(st.booleans()):
+        context["project_memory"] = draw(st.booleans())
+    if context:
+        document["context"] = context
+
     return document
 
 
@@ -150,3 +159,31 @@ def test_config_defaults_merge(document: dict) -> None:
         assert config.pricing.output_per_1k == pricing["output_per_1k"]
     else:
         assert config.pricing.output_per_1k is None
+
+    # --- Context flags (each independent) ---
+    context = document.get("context", {})
+    if "plan_reminder" in context:
+        assert config.plan_reminder == bool(context["plan_reminder"])
+    else:
+        assert config.plan_reminder is True
+
+    if "project_memory" in context:
+        assert config.project_memory == bool(context["project_memory"])
+    else:
+        assert config.project_memory is True
+
+    # --- Policy + checkpoint (Phase 2): new fields use their dataclass
+    # defaults when the partial document does not include the tables. ---
+    assert config.policy_mode == "autopilot"
+    assert config.shell_allowlist == ()
+    assert config.show_diffs is False
+    assert config.checkpoint_enabled is True
+    assert config.checkpoint_keep_turns == 10
+
+    # --- Phase 4 Ergonomics & UX defaults ---
+    assert config.ui_color is False
+    assert config.ui_spinner is False
+    assert config.commands_dir == ".forge/commands"
+    assert config.parallel_enabled is False
+    assert config.parallel_max_workers == 4
+    assert config.mentions_enabled is False

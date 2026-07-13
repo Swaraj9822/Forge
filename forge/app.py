@@ -52,6 +52,7 @@ from pathlib import Path
 from typing import TextIO
 
 from forge.agent import AgentLoop
+from forge.checkpoint import CheckpointStore
 from forge.config import (
     PROJECT_PLACEHOLDER,
     REGION_PLACEHOLDER,
@@ -62,16 +63,22 @@ from forge.config import (
 from forge.context import ContextManager
 from forge.interrupt import InterruptController
 from forge.mcp_client import McpClient, register_mcp_tools
+from forge.policy import ApprovalPolicy, AutonomyMode, ShellMatcher
 from forge.repl import Repl
 from forge.session import Session, SessionStore, TodoItem
 from forge.tools.base import Tool, ToolContext, ToolExecutor
 from forge.tools.fs import EditTool, ReadTool, WriteTool
 from forge.tools.git import GitTool
+from forge.tools.memory import RememberTool, SearchMemoryTool
 from forge.tools.planning import PlanningTool
+from forge.tools.repo_index import RepoIndexTool
 from forge.tools.search import SearchTool
 from forge.tools.shell import ShellTool
+from forge.tools.subagent import DelegateTool
 from forge.verification import VerificationCoordinator, VerificationRunner
-from forge.vertex import CredentialsError, VertexClient
+from forge.providers import Provider, build_provider, CredentialsError
+from forge.ui import Ui
+from forge.commands import SlashCommandStore
 
 __all__ = [
     "StartupError",
@@ -132,7 +139,7 @@ class App:
     config_manager: ConfigManager
     session_store: SessionStore
     interrupt: InterruptController
-    vertex_client: VertexClient
+    provider: Provider
     tool_executor: ToolExecutor
     context_manager: ContextManager
     usage_tracker: "object"
@@ -181,27 +188,37 @@ def _is_missing_required(value: str | None, placeholder: str) -> bool:
 
 
 def validate_required_config(config: Config) -> None:
-    """Validate that the required ``project`` and ``region`` are configured.
+    """Validate that the required configuration values for the active provider are present.
 
-    Raises :class:`StartupError` directing the user to run ``forge init`` when
-    either value is absent, blank, or still the placeholder (Req 2.4, 12.3). The
-    check runs *before* the Vertex client is constructed.
+    Raises :class:`StartupError` directing the user to run ``forge init`` or set
+    the appropriate environment variables.
     """
-    missing: list[str] = []
-    if _is_missing_required(config.project, PROJECT_PLACEHOLDER):
-        missing.append("GCP project ID")
-    if _is_missing_required(config.region, REGION_PLACEHOLDER):
-        missing.append("GCP region")
+    if config.provider_type == "vertex":
+        missing: list[str] = []
+        if _is_missing_required(config.project, PROJECT_PLACEHOLDER):
+            missing.append("GCP project ID")
+        if _is_missing_required(config.region, REGION_PLACEHOLDER):
+            missing.append("GCP region")
 
-    if not missing:
-        return
+        if not missing:
+            return
 
-    names = " and ".join(missing)
-    raise StartupError(
-        f"Required configuration value(s) missing: {names}. "
-        "Run 'forge init' to create a configuration file with the required "
-        "placeholders, then edit it to set your GCP project ID and region."
-    )
+        names = " and ".join(missing)
+        raise StartupError(
+            f"Required configuration value(s) missing: {names}. "
+            "Run 'forge init' to create a configuration file with the required "
+            "placeholders, then edit it to set your GCP project ID and region."
+        )
+    elif config.provider_type in ("anthropic", "openai"):
+        import os
+        api_key_var = config.provider_api_key_env or (
+            "ANTHROPIC_API_KEY" if config.provider_type == "anthropic" else "OPENAI_API_KEY"
+        )
+        if not os.environ.get(api_key_var):
+            raise StartupError(
+                f"Required environment variable '{api_key_var}' is missing or empty. "
+                f"Please export it to authorize the {config.provider_type} provider."
+            )
 
 
 def check_adc() -> None:
@@ -236,9 +253,9 @@ def build_builtin_registry() -> dict[str, Tool]:
     """Construct the built-in tools and return a ``name -> Tool`` registry.
 
     Every recognized built-in tool (read, write, edit, shell, search, git,
-    planning) is instantiated. Which of them are actually *exposed* to the Model
-    is decided by the executor's ``enabled`` set (sourced from
-    ``config.enabled_tools``), not by this registry.
+    planning, remember, search_memory, repo_index) is instantiated. Which of
+    them are actually *exposed* to the Model is decided by the executor's
+    ``enabled`` set (sourced from ``config.enabled_tools``), not by this registry.
     """
     tools: list[Tool] = [
         ReadTool(),
@@ -248,6 +265,10 @@ def build_builtin_registry() -> dict[str, Tool]:
         SearchTool(),
         GitTool(),
         PlanningTool(),
+        RememberTool(),
+        SearchMemoryTool(),
+        RepoIndexTool(),
+        DelegateTool(),
     ]
     return {tool.name: tool for tool in tools}
 
@@ -257,6 +278,9 @@ def _build_tool_executor(
     interrupt: InterruptController,
     workspace_root: Path,
     initial_todos: list[TodoItem] | None = None,
+    policy: ApprovalPolicy | None = None,
+    checkpoint: CheckpointStore | None = None,
+    provider: Provider | None = None,
 ) -> tuple[ToolExecutor, McpClient | None]:
     """Build the :class:`ToolExecutor` from built-in and accepted MCP tools.
 
@@ -272,6 +296,12 @@ def _build_tool_executor(
     seeded with a copy of those items under the ``"todos"`` key so the planning
     tool continues from the restored list rather than an empty one (Req 10.5,
     13.5).
+
+    ``policy`` and ``checkpoint`` are wired into the executor at construction
+    time so every subsequent :meth:`ToolExecutor.execute` consults them. The
+    approver is intentionally NOT wired here: it is run-path dependent
+    (interactive vs headless) and is set later via
+    :meth:`ToolExecutor.set_approver`.
     """
     registry = build_builtin_registry()
     enabled: set[str] = set(config.enabled_tools)
@@ -308,12 +338,18 @@ def _build_tool_executor(
         interrupt=interrupt,
         config=config,
         state=state,
+        provider=provider,
+        tool_registry=registry,
+        policy=policy,
+        approver=None,
     )
     executor = ToolExecutor(
         registry=registry,
         enabled=enabled,
         interrupt=interrupt,
         context=context,
+        policy=policy,
+        checkpoint=checkpoint,
     )
     return executor, mcp_client
 
@@ -321,6 +357,53 @@ def _build_tool_executor(
 # ---------------------------------------------------------------------------
 # Bootstrap
 # ---------------------------------------------------------------------------
+
+
+def run_prompt(
+    prompt: str,
+    *,
+    output: str = "text",
+    config_path: Path | None = None,
+    workspace_root: Path | None = None,
+    out: TextIO | None = None,
+    err: TextIO | None = None,
+    yes: bool = False,
+) -> int:
+    """Bootstrap and run a single prompt non-interactively (Feature A).
+
+    Returns the headless exit code. A StartupError (missing ADC / required
+    config) is printed to stderr and its exit code returned, mirroring `main`.
+
+    ``yes`` is threaded into :func:`forge.headless.run_headless` to wire the
+    approver: when ``True`` every gated call is auto-approved; when ``False``
+    any gated mutation is denied so the run cannot hang on a prompt that
+    cannot be answered (Phase 2, Feature B).
+    """
+    out = out if out is not None else sys.stdout
+    err = err if err is not None else sys.stderr
+    try:
+        app = bootstrap(
+            config_path=config_path,
+            workspace_root=workspace_root,
+        )
+    except StartupError as exc:
+        print(exc.message, file=err)
+        return exc.exit_code
+
+    from forge.headless import run_headless
+    try:
+        app.interrupt.install()
+        return run_headless(
+            app.agent_loop,
+            app.session,
+            app.verification_coordinator,
+            prompt,
+            output=output,
+            out=out,
+            yes=yes,
+        )
+    finally:
+        app.close()
 
 
 def bootstrap(
@@ -375,7 +458,7 @@ def bootstrap(
     validate_required_config(config)
 
     # 3. ADC smoke check (Req 2.3) — names `gcloud auth application-default login`.
-    if not skip_adc_check:
+    if not skip_adc_check and config.provider_type == "vertex":
         check_adc()
 
     # 4. SessionStore rooted at the OS-conventional sessions directory.
@@ -386,18 +469,93 @@ def bootstrap(
     # 5. Interrupt controller (the SIGINT handler is installed when the App runs).
     interrupt = InterruptController()
 
-    # 6. Vertex client (lazily connects; no credential/network call yet).
-    vertex_client = VertexClient(config, interrupt)
+    # 6. Provider (lazily connects; no credential/network call yet).
+    provider = build_provider(config, interrupt)
 
     # 7. Tool executor: built-in tools + accepted MCP tools. Seed the planning
     #    tool's state from any restored todos so `forge resume` keeps continuity.
+    #    Phase 2: wire the approval policy and (optionally) the checkpoint
+    #    store into the executor at construction time so every execute() call
+    #    consults them. The approver is set later (interactive = Repl, headless
+    #    = AutoApprover / DenyMutationsApprover).
     root = Path(workspace_root) if workspace_root is not None else Path.cwd()
+
+    policy = ApprovalPolicy(
+        mode=AutonomyMode(config.policy_mode),
+        shell=ShellMatcher(tuple(config.shell_allowlist)),
+    )
+
+    checkpoint: CheckpointStore | None = None
+    if config.checkpoint_enabled:
+        checkpoint = CheckpointStore(
+            root=root,
+            store_dir=root / ".forge" / "checkpoints",
+            keep_turns=config.checkpoint_keep_turns,
+            max_bytes=config.read_max_bytes,
+        )
+
     tool_executor, mcp_client = _build_tool_executor(
-        config, interrupt, root, session.todos
+        config, interrupt, root, session.todos,
+        policy=policy, checkpoint=checkpoint,
+        provider=provider,
     )
 
     # 8. Context manager, summarized by the Vertex client during compaction.
-    context_manager = ContextManager(config, summarizer=vertex_client)
+    #    Phase 3: wire MemoryProvider and RepoMapProvider when enabled.
+    from forge.context import DEFAULT_PROJECT_MEMORY_FILES
+    from forge.context_providers import PlanReminderProvider
+
+    providers = []
+    if config.plan_reminder:
+        providers.append(PlanReminderProvider())
+
+    # Phase 3: memory store and repo indexer (built when enabled)
+    memory_store = None
+    repo_indexer = None
+
+    if config.memory_enabled:
+        from forge.memory import MemoryStore
+        from forge.context_providers import MemoryProvider
+
+        memory_store = MemoryStore(
+            root / ".forge" / "memory.jsonl",
+            max_records=config.memory_max_records,
+            workspace_root=root,
+        )
+        providers.append(
+            MemoryProvider(
+                memory_store,
+                limit=config.memory_inject_limit,
+                char_budget=config.memory_inject_char_budget,
+            )
+        )
+        # Wire memory store into the tool context
+        tool_executor.set_memory(memory_store)
+
+    if config.repo_map_enabled:
+        from forge.repo_index import RepoIndexer
+
+        repo_indexer = RepoIndexer(root, output_cap=config.output_cap_chars)
+
+    if config.repo_map_enabled and config.repo_map_inject:
+        from forge.context_providers import RepoMapProvider
+
+        providers.append(
+            RepoMapProvider(
+                repo_indexer,
+                char_budget=config.repo_map_char_budget,
+            )
+        )
+
+    context_manager = ContextManager(
+        config,
+        summarizer=provider,
+        providers=providers,
+        workspace_root=root,
+        project_memory_filenames=(
+            DEFAULT_PROJECT_MEMORY_FILES if config.project_memory else ()
+        ),
+    )
 
     # 9. Usage tracker (cost computed from config.pricing). Seed the cumulative
     #    (session) tallies from a restored session so a resumed session's totals
@@ -409,23 +567,44 @@ def bootstrap(
         session.usage.input_tokens, session.usage.output_tokens
     )
 
-    # 10. Agent loop wiring all of the above together.
+    # 10. Agent loop wiring all of the above together. Phase 2: the agent
+    #     loop owns the checkpoint turn boundaries (begin/commit around each
+    #     turn body) so /undo reverts whole turns rather than individual tools.
     agent_loop = AgentLoop(
         context_manager=context_manager,
-        vertex_client=vertex_client,
+        provider=provider,
         tool_executor=tool_executor,
         usage_tracker=usage_tracker,
         session_store=session_store,
         interrupt=interrupt,
+        checkpoint=checkpoint,
+        parallel_enabled=config.parallel_enabled,
+        parallel_max_workers=config.parallel_max_workers,
     )
 
-    # 11. The REPL drives the agent loop and renders its output.
+    # 11. The REPL drives the agent loop and renders its output. It is also
+    #     the interactive Approver and owns the /undo command, so the
+    #     checkpoint store and show_diffs flag are threaded in here.
+    ui = Ui(out, color=config.ui_color, spinner=config.ui_spinner)
+    commands_store = SlashCommandStore([root / config.commands_dir])
+
     repl = Repl(
         agent_loop=agent_loop,
         session=session,
         input_func=input_func,
         out=out,
+        checkpoint=checkpoint,
+        show_diffs=config.show_diffs,
+        ui=ui,
+        commands_store=commands_store,
+        mentions_enabled=config.mentions_enabled,
+        read_max_bytes=config.read_max_bytes,
+        workspace_root=root,
     )
+    # Wire the REPL as the executor's Approver. The executor is constructed
+    # first because the REPL itself needs the agent loop, which needs the
+    # executor; this final set_approver closes the loop.
+    tool_executor.set_approver(repl)
 
     # 12. Verification phase. The runner reuses the shell execution core rooted
     #     at the same workspace and shares the interrupt controller; the
@@ -451,7 +630,7 @@ def bootstrap(
         config_manager=config_manager,
         session_store=session_store,
         interrupt=interrupt,
-        vertex_client=vertex_client,
+        provider=provider,
         tool_executor=tool_executor,
         context_manager=context_manager,
         usage_tracker=usage_tracker,

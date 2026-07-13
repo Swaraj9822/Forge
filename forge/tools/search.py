@@ -60,6 +60,7 @@ class SearchTool:
         "are scoped to the workspace; content results are capped at 100 "
         "matches and each line at 500 characters."
     )
+    read_only = True
     parameters: dict = {
         "type": "object",
         "properties": {
