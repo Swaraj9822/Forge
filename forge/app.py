@@ -368,6 +368,8 @@ def run_prompt(
     out: TextIO | None = None,
     err: TextIO | None = None,
     yes: bool = False,
+    max_turns: int | None = None,
+    max_cost: float | None = None,
 ) -> int:
     """Bootstrap and run a single prompt non-interactively (Feature A).
 
@@ -378,6 +380,11 @@ def run_prompt(
     approver: when ``True`` every gated call is auto-approved; when ``False``
     any gated mutation is denied so the run cannot hang on a prompt that
     cannot be answered (Phase 2, Feature B).
+
+    ``max_turns`` / ``max_cost`` set the run's budgets (Phase 6). ``--max-cost``
+    requires model pricing to be configured; without it cost is unavailable and
+    the budget could never trip, so the run is refused up front with a clear
+    message rather than silently ignoring the flag.
     """
     out = out if out is not None else sys.stdout
     err = err if err is not None else sys.stderr
@@ -390,6 +397,26 @@ def run_prompt(
         print(exc.message, file=err)
         return exc.exit_code
 
+    # --max-cost is only meaningful when pricing is configured; refuse rather
+    # than let a budget that can never take effect give false CI assurance.
+    if max_cost is not None:
+        pricing = app.config.pricing
+        if (
+            pricing is None
+            or pricing.input_per_1k is None
+            or pricing.output_per_1k is None
+        ):
+            from forge.headless import EXIT_TURN_ERROR
+
+            print(
+                "--max-cost requires model pricing to be configured under "
+                "[pricing] (input_per_1k and output_per_1k); without it cost "
+                "is unavailable and the budget could never take effect.",
+                file=err,
+            )
+            app.close()
+            return EXIT_TURN_ERROR
+
     from forge.headless import run_headless
     try:
         app.interrupt.install()
@@ -401,6 +428,8 @@ def run_prompt(
             output=output,
             out=out,
             yes=yes,
+            max_turns=max_turns,
+            max_cost=max_cost,
         )
     finally:
         app.close()
@@ -600,6 +629,7 @@ def bootstrap(
         mentions_enabled=config.mentions_enabled,
         read_max_bytes=config.read_max_bytes,
         workspace_root=root,
+        config=config,
     )
     # Wire the REPL as the executor's Approver. The executor is constructed
     # first because the REPL itself needs the agent loop, which needs the

@@ -283,10 +283,13 @@ class RepoIndexer:
 
                 file_path = dir_path / filename
 
-                # Symlink safety: skip if resolved path is outside root
+                # Symlink safety: skip if resolved path is outside root.
+                # Use path-aware containment (is_relative_to) rather than a
+                # string prefix, which would wrongly accept a sibling like
+                # ``/workspace-evil`` for root ``/workspace``.
                 try:
                     resolved = file_path.resolve()
-                    if not str(resolved).startswith(str(self._root)):
+                    if not resolved.is_relative_to(self._root):
                         continue
                 except (OSError, ValueError):
                     continue

@@ -93,8 +93,14 @@ class ShellMatcher:
           ``<``, newline, ``&&``, ``||``) makes the command unsafe.
         * A command that does not parse (e.g. unterminated quotes) is unsafe.
         * An empty parsed argv is unsafe.
-        * Otherwise the first token (``argv[0]``, the program) must appear in
-          :attr:`allowlist`.
+        * Otherwise the command's leading tokens must match an allowlist entry.
+          An entry is matched by *token sequence*, not substring: a single-token
+          entry (``"git"``) matches any invocation of that program (``git`` with
+          any args), while a multi-token entry (``"git status"``) matches only
+          when the command's leading tokens are exactly that sequence. This lets
+          an allowlist be as broad (``"git"``) or as narrow (``"git status"``)
+          as the operator wants, so a bare program need not implicitly approve
+          its every destructive subcommand.
         """
 
         if any(tok in command for tok in _SHELL_METACHARS):
@@ -109,13 +115,25 @@ class ShellMatcher:
             return False
         if not argv:
             return False
-        program = argv[0]
-        return program in self.allowlist
+        for entry in self.allowlist:
+            try:
+                entry_tokens = shlex.split(entry, posix=True)
+            except ValueError:
+                continue
+            if not entry_tokens:
+                continue
+            if argv[: len(entry_tokens)] == entry_tokens:
+                return True
+        return False
 
 
-# Git subcommands that mutate the repository/working tree and therefore need
-# approval in non-autopilot modes (the rest are read-only and pass).
-_GIT_MUTATING = frozenset({"add", "commit", "checkout", "stash"})
+# Git subcommands that are read-only (inspect history / working tree without
+# modifying the repository). Anything NOT in this set — including any future
+# addition such as ``push``/``reset``/``clean`` — is treated as mutating and
+# therefore requires approval in non-autopilot modes. Classifying by an
+# explicit read-only allowlist (rather than a mutating denylist) makes the
+# policy fail *closed*: an unrecognized operation is gated, not waved through.
+_GIT_READONLY = frozenset({"status", "diff", "log", "show", "branch"})
 
 
 @dataclass(frozen=True)
@@ -174,15 +192,18 @@ class ApprovalPolicy:
     def _is_git_readonly(name: str, args: dict) -> bool:
         """Return ``True`` when ``name='git'`` and the op is a read-only one.
 
-        The git tool's mutating surface is per-operation (``add``/``commit``/
-        ``checkout``/``stash``); anything else (``status``/``diff``/``log``/
-        ``show``/``branch``) is treated as read-only for gating purposes.
+        Gating is decided by an explicit read-only allowlist
+        (``status``/``diff``/``log``/``show``/``branch``). Every other
+        operation — the mutating ones (``add``/``commit``/``checkout``/
+        ``stash``) and any unrecognized/future op (``push``/``reset``/
+        ``clean``) — is treated as needing approval, so the policy fails
+        closed rather than open.
         """
 
         if name != "git":
             return False
         op = args.get("operation")
-        return isinstance(op, str) and op not in _GIT_MUTATING
+        return isinstance(op, str) and op in _GIT_READONLY
 
 
 @runtime_checkable

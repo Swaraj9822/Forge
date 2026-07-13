@@ -53,6 +53,36 @@ from forge.session import (
 __all__ = ["main", "build_parser"]
 
 
+def _positive_int(value: str) -> int:
+    """argparse type: a positive integer (>= 1)."""
+    try:
+        parsed = int(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError(
+            f"expected an integer >= 1, got {value!r}"
+        )
+    if parsed < 1:
+        raise argparse.ArgumentTypeError(
+            f"expected an integer >= 1, got {parsed}"
+        )
+    return parsed
+
+
+def _positive_float(value: str) -> float:
+    """argparse type: a positive number (> 0)."""
+    try:
+        parsed = float(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError(
+            f"expected a number > 0, got {value!r}"
+        )
+    if parsed <= 0:
+        raise argparse.ArgumentTypeError(
+            f"expected a number > 0, got {parsed}"
+        )
+    return parsed
+
+
 def build_parser() -> argparse.ArgumentParser:
     """Construct the argument parser for the ``forge`` CLI.
 
@@ -103,6 +133,21 @@ def build_parser() -> argparse.ArgumentParser:
         help="Auto-approve every gated tool call in non-interactive runs. "
         "Without this flag a headless supervised run refuses mutations "
         "rather than hanging on a prompt it cannot answer (Phase 2).",
+    )
+    parser.add_argument(
+        "--max-turns",
+        type=_positive_int,
+        default=None,
+        help="Non-interactive runs only: cap the number of model round-trips "
+        "in the turn. Reaching the cap stops the run with exit code 5.",
+    )
+    parser.add_argument(
+        "--max-cost",
+        type=_positive_float,
+        default=None,
+        help="Non-interactive runs only: cap the cumulative estimated spend "
+        "(USD). Reaching the budget stops the run with exit code 5. Requires "
+        "model pricing to be configured under [pricing].",
     )
 
     return parser
@@ -199,10 +244,20 @@ def _run_headless(
     yes: bool,
     out: TextIO,
     err: TextIO,
+    max_turns: int | None = None,
+    max_cost: float | None = None,
 ) -> int:
     """Route into app.run_prompt, handling the fatal startup errors like _run_repl."""
     try:
-        return run_prompt(prompt, output=output, out=out, err=err, yes=yes)
+        return run_prompt(
+            prompt,
+            output=output,
+            out=out,
+            err=err,
+            yes=yes,
+            max_turns=max_turns,
+            max_cost=max_cost,
+        )
     except ConfigError as exc:
         print(str(exc), file=err)
         return 1
@@ -273,7 +328,13 @@ def main(
             print("Empty prompt; nothing to do.", file=err)
             return 1
         return _run_headless(
-            prompt, output=args.output, yes=args.yes, out=out, err=err
+            prompt,
+            output=args.output,
+            yes=args.yes,
+            out=out,
+            err=err,
+            max_turns=args.max_turns,
+            max_cost=args.max_cost,
         )
 
     if args.command == "init":

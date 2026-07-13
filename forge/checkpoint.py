@@ -21,8 +21,10 @@ that the file cannot be restored. This bounds the worst-case snapshot cost.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
+import shutil
 import tempfile
 import time
 from dataclasses import dataclass, field
@@ -52,7 +54,13 @@ _DEFAULT_MAX_BYTES = 1_000_000
 
 
 def _atomic_write_bytes(target: Path, payload: bytes) -> None:
-    """Write ``payload`` to ``target`` atomically (tempfile + os.replace)."""
+    """Write ``payload`` to ``target`` atomically (tempfile + os.replace).
+
+    When ``target`` already exists its permission bits are copied onto the temp
+    file before the replace, so restoring a file via ``/undo`` preserves its
+    mode (mkstemp otherwise creates the temp file 0600 and os.replace keeps
+    that mode).
+    """
 
     target.parent.mkdir(parents=True, exist_ok=True)
     fd, tmp_path = tempfile.mkstemp(
@@ -61,6 +69,11 @@ def _atomic_write_bytes(target: Path, payload: bytes) -> None:
     try:
         with os.fdopen(fd, "wb") as handle:
             handle.write(payload)
+        if target.exists():
+            try:
+                shutil.copymode(target, tmp_path)
+            except OSError:
+                pass
         os.replace(tmp_path, target)
     except Exception:
         # Best-effort cleanup of the temp file on any failure.
@@ -218,8 +231,6 @@ class CheckpointStore:
 
         # Hash the snapshot filename so very long paths do not exceed the
         # filesystem limit; the manifest carries the real path.
-        import hashlib
-
         digest = hashlib.sha1(key.encode("utf-8")).hexdigest()
         snapshot_path = turn_dir / f"{digest}.blob"
         try:
@@ -342,8 +353,9 @@ class CheckpointStore:
         ``(None, None)`` if there is nothing to undo.
 
         A committed turn is any subdirectory of ``store_dir`` that has a
-        ``manifest.json``. Sort key is the directory name (the millisecond
-        timestamp) so the newest is last in lexical order.
+        ``manifest.json``. Sort key is the directory name (a zero-padded
+        nanosecond timestamp plus a per-store sequence counter) so the newest
+        is last in lexical order.
         """
 
         if not self.store_dir.exists():

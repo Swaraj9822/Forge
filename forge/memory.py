@@ -15,7 +15,7 @@ import re
 import tempfile
 import uuid
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -162,8 +162,12 @@ def _check_staleness(
             mtime = datetime.fromtimestamp(
                 full_path.stat().st_mtime, tz=timezone.utc
             )
-            # Compare with 1-second tolerance for filesystem resolution
-            if mtime > mem_time.replace(microsecond=0):
+            # Allow a 1-second tolerance for filesystem mtime resolution: only
+            # a file modified more than a second AFTER the memory was created
+            # marks it stale. (Adding the tolerance to the memory time — rather
+            # than truncating it down — is what makes this a tolerance instead
+            # of a bias toward false staleness.)
+            if mtime > mem_time + timedelta(seconds=1):
                 return True
         except OSError:
             return True
@@ -324,36 +328,22 @@ class MemoryStore:
         self._write_all(kept)
 
     def _append_record(self, record: MemoryRecord) -> None:
-        """Append a single record to the JSONL file atomically."""
+        """Append a single record to the JSONL file.
+
+        Uses a plain append (``open(..., "a")``) rather than a
+        read-all/rewrite/replace cycle. Appending one line is O(1) in the store
+        size and — because each record is a self-contained line — is robust
+        under concurrent writers: two sessions appending at once each add their
+        own line instead of racing on a whole-file rewrite where one update
+        would be lost. A crash mid-line leaves a partial trailing line, which
+        :meth:`all` already tolerates by skipping unparsable lines.
+        """
         line = json.dumps(record.to_dict(), ensure_ascii=False) + "\n"
 
-        # For atomic append, we read all + new, write temp, replace
-        existing = b""
-        if self._path.is_file():
-            try:
-                existing = self._path.read_bytes()
-            except OSError:
-                existing = b""
-
-        new_data = existing + line.encode("utf-8")
-
-        # Write to temp file in same directory for atomic replace
         parent = self._path.parent
         parent.mkdir(parents=True, exist_ok=True)
-        fd, tmp_path = tempfile.mkstemp(
-            prefix=f".{self._path.name}.", suffix=".tmp", dir=str(parent)
-        )
-        try:
-            with os.fdopen(fd, "wb") as f:
-                f.write(new_data)
-            os.replace(tmp_path, self._path)
-        except OSError:
-            # Clean up temp on failure
-            try:
-                os.unlink(tmp_path)
-            except OSError:
-                pass
-            raise
+        with open(self._path, "a", encoding="utf-8") as f:
+            f.write(line)
 
     def _write_all(self, records: list[MemoryRecord]) -> None:
         """Rewrite the entire JSONL file with the given records atomically."""

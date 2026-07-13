@@ -248,6 +248,15 @@ class ToolExecutor:
         """Return whether ``name`` is exposed to the Model and runnable."""
         return name in self._registry and name in self._enabled
 
+    def get_tool(self, name: str) -> Tool | None:
+        """Return the registered :class:`Tool` for ``name``, or ``None``.
+
+        A small public accessor so collaborators (e.g. the agent loop's
+        parallel-eligibility check) can inspect a registered tool's attributes
+        without reaching into the private registry.
+        """
+        return self._registry.get(name)
+
     def specs(self) -> list[ToolSpec]:
         """Return a :class:`ToolSpec` for each exposed tool.
 

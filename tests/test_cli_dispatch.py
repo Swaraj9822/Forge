@@ -284,7 +284,7 @@ def test_headless_prompt_dispatches_to_run_prompt(monkeypatch) -> None:
     """``forge -p <prompt>`` routes into app.run_prompt and returns its code."""
     calls: list[tuple] = []
 
-    def fake_run_prompt(prompt, *, output="text", config_path=None, workspace_root=None, out=None, err=None, yes=False):
+    def fake_run_prompt(prompt, *, output="text", config_path=None, workspace_root=None, out=None, err=None, yes=False, **kwargs):
         calls.append((prompt, output))
         return 42
 

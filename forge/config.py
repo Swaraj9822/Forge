@@ -62,6 +62,12 @@ DEFAULT_LIMITS: dict[str, int] = {
     "mcp_connect_timeout_s": 30,
 }
 
+# Allowed values for the Gemini 3 ``provider.thinking_level`` control. These map
+# to the ``thinking_level`` request parameter (minimal/low/medium/high) that
+# replaced ``thinking_budget`` for Gemini 3 models. ``None`` (absent) leaves the
+# model's own default thinking level in place.
+THINKING_LEVELS: tuple[str, ...] = ("minimal", "low", "medium", "high")
+
 # Placeholders emitted by `forge init` for the two required values.
 PROJECT_PLACEHOLDER = "REPLACE_WITH_GCP_PROJECT_ID"
 REGION_PLACEHOLDER = "REPLACE_WITH_GCP_REGION"
@@ -306,6 +312,10 @@ class Config:
     provider_type: str = "vertex"
     provider_api_key_env: str | None = None
     provider_base_url: str | None = None
+    # Amount of internal reasoning the model performs. Maps to the Gemini 3
+    # ``thinking_level`` request parameter (minimal/low/medium/high). ``None``
+    # leaves the model's default thinking level untouched.
+    provider_thinking_level: str | None = None
     subagents_enabled: bool = False
     subagents_default_tools: list[str] = field(default_factory=lambda: ["read", "search", "repo_index", "search_memory"])
     subagents_max_turns: int = 4
@@ -421,6 +431,27 @@ class ConfigManager:
         
         provider_api_key_env = provider_raw.get("api_key_env")
         provider_base_url = provider_raw.get("base_url")
+
+        provider_thinking_level = provider_raw.get("thinking_level")
+        if provider_thinking_level is not None:
+            if not isinstance(provider_thinking_level, str):
+                raise ConfigError(
+                    ConfigManager.config_path(),
+                    detail=(
+                        "provider.thinking_level must be a string, got "
+                        f"{type(provider_thinking_level).__name__}"
+                    ),
+                )
+            provider_thinking_level = provider_thinking_level.strip().lower()
+            if provider_thinking_level not in THINKING_LEVELS:
+                allowed = ", ".join(THINKING_LEVELS)
+                raise ConfigError(
+                    ConfigManager.config_path(),
+                    detail=(
+                        f"provider.thinking_level must be one of {{{allowed}}}, "
+                        f"got {provider_raw.get('thinking_level')!r}"
+                    ),
+                )
 
         subagents_raw = raw.get("subagents") or {}
         subagents_enabled = bool(subagents_raw.get("enabled", False))
@@ -599,6 +630,7 @@ class ConfigManager:
             provider_type=provider_type,
             provider_api_key_env=provider_api_key_env,
             provider_base_url=provider_base_url,
+            provider_thinking_level=provider_thinking_level,
             subagents_enabled=subagents_enabled,
             subagents_default_tools=subagents_default_tools,
             subagents_max_turns=subagents_max_turns,
@@ -677,7 +709,9 @@ class ConfigManager:
                 "mode": "supervised",
                 "shell_allowlist": [
                     "pytest",
-                    "git",
+                    "git status",
+                    "git diff",
+                    "git log",
                     "ls",
                     "cat",
                     "python -m pytest",

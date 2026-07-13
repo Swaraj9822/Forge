@@ -184,7 +184,7 @@ class VertexProvider(Provider):
     def _build_request_config(
         self, tools: list[ToolSpec], system_instruction: str | None = None
     ) -> Any | None:
-        """Build the SDK request config (tools + system instruction)."""
+        """Build the SDK request config (tools + system instruction + thinking)."""
         if _genai_types is None:
             return None
         kwargs: dict[str, Any] = {}
@@ -193,11 +193,38 @@ class VertexProvider(Provider):
             kwargs["tools"] = sdk_tools
         if system_instruction:
             kwargs["system_instruction"] = system_instruction
+        thinking_config = self._build_thinking_config()
+        if thinking_config is not None:
+            kwargs["thinking_config"] = thinking_config
         if not kwargs:
             return None
         try:
             return _genai_types.GenerateContentConfig(**kwargs)
         except Exception:  # noqa: BLE001 - degrade gracefully without typed config
+            # A thinking_config that this SDK/model build rejects must not drop
+            # tools/system_instruction: retry once without it before giving up.
+            if "thinking_config" in kwargs:
+                kwargs.pop("thinking_config")
+                try:
+                    return _genai_types.GenerateContentConfig(**kwargs)
+                except Exception:  # noqa: BLE001
+                    return None
+            return None
+
+    def _build_thinking_config(self) -> Any | None:
+        """Build a ``ThinkingConfig`` from ``provider.thinking_level`` if set.
+
+        Returns ``None`` when no level is configured (leaving the model's own
+        default thinking behavior untouched) or when the installed SDK does not
+        accept the ``thinking_level`` field, so an older SDK degrades to the
+        prior behavior rather than failing the request.
+        """
+        level = getattr(self._config, "provider_thinking_level", None)
+        if not level or _genai_types is None:
+            return None
+        try:
+            return _genai_types.ThinkingConfig(thinking_level=level)
+        except Exception:  # noqa: BLE001 - SDK too old for thinking_level
             return None
 
     # -- public streaming API ------------------------------------------------
@@ -468,10 +495,16 @@ def _parse_chunk(chunk: Any) -> list[StreamEvent]:
     if usage is not None:
         input_tokens = getattr(usage, "prompt_token_count", None) or 0
         output_tokens = getattr(usage, "candidates_token_count", None) or 0
+        # Thinking models report reasoning tokens separately in
+        # ``thoughts_token_count``; ``candidates_token_count`` excludes them.
+        # Gemini bills those thinking tokens at the output rate, so fold them
+        # into the output tally to keep both the token count and the estimated
+        # cost accurate (otherwise a thinking model under-reports both).
+        thoughts_tokens = getattr(usage, "thoughts_token_count", None) or 0
         events.append(
             UsageReport(
                 input_tokens=int(input_tokens),
-                output_tokens=int(output_tokens),
+                output_tokens=int(output_tokens) + int(thoughts_tokens),
             )
         )
 

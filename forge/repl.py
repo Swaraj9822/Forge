@@ -44,10 +44,11 @@ exactly once per change regardless of which path observed it.
 from __future__ import annotations
 
 import sys
+import time
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, Protocol, TextIO
 
-from forge.ui import Ui
+from forge.ui import Ui, describe_tool
 
 from forge.agent import AgentLoop, TurnResult
 from forge.context import CompactionInfo
@@ -119,6 +120,17 @@ def is_blank(text: str) -> bool:
     """
 
     return text.strip() == ""
+
+
+def _fmt_tokens(n: int) -> str:
+    """Humanize a token count for the usage line (e.g. ``5.7k``)."""
+    try:
+        n = int(n)
+    except (TypeError, ValueError):
+        return str(n)
+    if n >= 1000:
+        return f"{n / 1000:.1f}k"
+    return str(n)
 
 
 def _approval_target(name: str, args: dict) -> str:
@@ -259,6 +271,7 @@ class Repl:
         mentions_enabled: bool = False,
         read_max_bytes: int = 1_000_000,
         workspace_root: Path | None = None,
+        config: Any | None = None,
     ) -> None:
         self.agent_loop = agent_loop
         self.session = session
@@ -273,6 +286,10 @@ class Repl:
         self.mentions_enabled = bool(mentions_enabled)
         self.read_max_bytes = int(read_max_bytes)
         self.workspace_root = workspace_root if workspace_root is not None else Path.cwd()
+        self.config = config
+        # Active "thinking" spinner context manager (None when idle). Started
+        # while waiting on the model and cleared as soon as output arrives.
+        self._spinner_cm: Any | None = None
         # Session-scoped set of tool+target keys the user has answered
         # ``a`` (always-approve) for in this REPL session. APPROVE_ALWAYS
         # bookkeeping lives here, not in the executor, per the design.
@@ -319,6 +336,7 @@ class Repl:
         also returns control to the shell.
         """
 
+        self._render_banner()
         while True:
             try:
                 keep_going = self.run_once()
@@ -355,7 +373,10 @@ class Repl:
             return True
 
         if line == "/help" or line == "/commands":
-            builtins = ["/exit", "/quit", "/undo", "/help", "/commands"]
+            builtins = [
+                "/exit", "/quit", "/undo", "/help", "/commands",
+                "/cost", "/tools", "/model", "/clear",
+            ]
             customs = []
             if self.commands_store is not None:
                 customs = self.commands_store.names()
@@ -364,6 +385,19 @@ class Repl:
             if customs:
                 self._writeln("Custom commands:")
                 self._writeln("  " + ", ".join(f"/{c}" for c in customs))
+            return True
+
+        if line == "/cost":
+            self._render_cost()
+            return True
+        if line == "/tools":
+            self._render_tools()
+            return True
+        if line == "/model":
+            self._render_model()
+            return True
+        if line == "/clear":
+            self.ui.clear()
             return True
 
         if line.startswith("/"):
@@ -399,10 +433,18 @@ class Repl:
             for warning in warnings:
                 self._writeln(f"[warning] {warning}")
 
-        result = self.agent_loop.run_turn(self.session, line)
+        # Show a "thinking" spinner while waiting on the model; it clears as
+        # soon as the first output (text/tool/compaction) arrives. Also measure
+        # the turn's wall-clock time to report on the end-of-response line.
+        turn_start = time.monotonic()
+        self._start_spinner()
+        try:
+            result = self.agent_loop.run_turn(self.session, line)
+        finally:
+            self._stop_spinner()
+        elapsed = time.monotonic() - turn_start
 
-        # After a turn that completed normally (not interrupted, no error), run
-        # the post-turn Verification_Phase when a coordinator is wired. When the
+        # After a turn that completed normally (not interrupted, no error), run        # the post-turn Verification_Phase when a coordinator is wired. When the
         # phase ran, its aggregated usage (turn + all Correction_Iterations)
         # replaces the bare turn usage in the summary; otherwise rendering is
         # exactly as today (Req 2.3, 9, 10).
@@ -413,7 +455,7 @@ class Repl:
             if phase.ran:
                 usage_override = phase.usage
 
-        self._render_turn_result(result, usage_override=usage_override)
+        self._render_turn_result(result, usage_override=usage_override, elapsed=elapsed)
         return True
 
     # -- Renderer hooks (driven by the AgentLoop during a turn) --------------
@@ -421,28 +463,41 @@ class Repl:
     def on_text(self, text: str) -> None:
         """Render a streamed fragment of model text immediately (Req 3.1)."""
 
+        self._stop_spinner()
         self._write(text)
 
-    def on_tool(self, name: str) -> None:
-        """Announce the tool about to run, before it executes (Req 3.2)."""
+    def on_tool(self, name: str, args: dict | None = None) -> None:
+        """Announce the tool about to run, before it executes (Req 3.2).
 
-        announcement = self.ui.tool_announcement(name)
+        When ``args`` are provided, a short description of the call's target
+        (path, command, pattern, …) is appended so the user can see *what* the
+        tool is doing, not just its name.
+        """
+
+        self._stop_spinner()
+        detail = describe_tool(name, args)
+        announcement = self.ui.tool_call(name, detail)
         self._writeln(announcement)
 
-    def on_tool_result(self, name: str, denied: bool, forbidden: bool,
-                       diff: str | None) -> None:
+    def on_tool_result(self, name: str, *, denied: bool, forbidden: bool,
+                       diff: str | None, ok: bool = True,
+                       summary: str | None = None) -> None:
         """Render a post-execution notice for a single tool result (Phase 2).
 
-        Called by the :class:`~forge.agent.AgentLoop` after each tool result is
-        appended to the session. Used to surface denial / forbiddance (the
-        approval policy refused the call) and — when ``show_diffs`` is enabled
-        — the unified diff for a successful write/edit.
+        Surfaces denial/forbiddance from the approval policy, a concise
+        success summary (e.g. ``42 lines``), a failure message when the tool
+        did not succeed, and — when ``show_diffs`` is enabled — the unified
+        diff for a successful write/edit.
         """
 
         if denied:
-            self._writeln(f"[denied] {name}")
+            self._writeln(self.ui.tool_result_line("denied by approval policy", "warn"))
         elif forbidden:
-            self._writeln(f"[forbidden] {name}")
+            self._writeln(self.ui.tool_result_line("forbidden by approval policy", "warn"))
+        elif not ok:
+            self._writeln(self.ui.tool_result_line(f"error: {summary or 'failed'}", "error"))
+        elif summary:
+            self._writeln(self.ui.tool_result_line(summary, "ok"))
         if diff and self.show_diffs:
             self.ui.render_diff(diff)
 
@@ -453,6 +508,7 @@ class Repl:
     def on_compaction(self, info: CompactionInfo) -> None:
         """Render the "conversation context was compacted" notice (Req 14.7)."""
 
+        self._stop_spinner()
         self._writeln("\n[notice] conversation context was compacted")
 
     def on_todos(self, todos: list[TodoItem]) -> None:
@@ -566,7 +622,8 @@ class Repl:
     # -- post-turn rendering -------------------------------------------------
 
     def _render_turn_result(
-        self, result: TurnResult, usage_override: UsageSummary | None = None
+        self, result: TurnResult, usage_override: UsageSummary | None = None,
+        elapsed: float | None = None,
     ) -> None:
         """Render everything that follows a completed :meth:`run_turn`.
 
@@ -584,7 +641,10 @@ class Repl:
 
         # End-of-response indicator (Req 3.3). A leading newline ensures it sits
         # on its own line after any streamed text that did not end with one.
-        self._writeln("\n[end of response]")
+        if elapsed is not None:
+            self._writeln(f"\n[end of response] ({elapsed:.1f}s)")
+        else:
+            self._writeln("\n[end of response]")
 
         # Error / interruption indicator (Req 3.4). The partial response already
         # streamed to the terminal is deliberately NOT cleared.
@@ -604,17 +664,19 @@ class Repl:
     def _render_usage(self, u: UsageSummary) -> None:
         """Print turn and cumulative token counts and estimated cost.
 
-        When ``cost_available`` is ``False`` the cost is shown as
-        "cost unavailable" (Req 17.5); otherwise the estimated turn and
-        cumulative costs are shown (Req 17.3, 17.4).
+        Token counts are humanized (e.g. ``5.7k``) for readability. When
+        ``cost_available`` is ``False`` the cost is shown as "cost unavailable"
+        (Req 17.5); otherwise the estimated turn and cumulative costs are shown
+        (Req 17.3, 17.4).
         """
 
         turn_tokens = (
-            f"turn: {u.turn_input_tokens} in / {u.turn_output_tokens} out"
+            f"turn: {_fmt_tokens(u.turn_input_tokens)} in / "
+            f"{_fmt_tokens(u.turn_output_tokens)} out"
         )
         cumulative_tokens = (
-            f"session: {u.cumulative_input_tokens} in / "
-            f"{u.cumulative_output_tokens} out"
+            f"session: {_fmt_tokens(u.cumulative_input_tokens)} in / "
+            f"{_fmt_tokens(u.cumulative_output_tokens)} out"
         )
 
         if u.cost_available:
@@ -626,6 +688,97 @@ class Repl:
             cost = "cost unavailable"
 
         self._writeln(f"[usage] {turn_tokens} | {cumulative_tokens} | {cost}")
+
+    # -- spinner / banner / info commands ------------------------------------
+
+    def _start_spinner(self, message: str = "Thinking...") -> None:
+        """Start the "thinking" spinner if not already active (no-op fallback)."""
+        if self._spinner_cm is not None:
+            return
+        cm = self.ui.status(message)
+        try:
+            cm.__enter__()
+            self._spinner_cm = cm
+        except Exception:  # noqa: BLE001 - spinner is best-effort
+            self._spinner_cm = None
+
+    def _stop_spinner(self) -> None:
+        """Stop the active spinner, if any (idempotent)."""
+        cm = self._spinner_cm
+        if cm is None:
+            return
+        self._spinner_cm = None
+        try:
+            cm.__exit__(None, None, None)
+        except Exception:  # noqa: BLE001 - spinner is best-effort
+            pass
+
+    def _render_banner(self) -> None:
+        """Print a one-time startup banner orienting the user (interactive only)."""
+        if self.config is None:
+            return
+        cfg = self.config
+        provider = getattr(cfg, "provider_type", "?")
+        thinking = getattr(cfg, "provider_thinking_level", None)
+        if thinking:
+            provider = f"{provider} (thinking: {thinking})"
+        rows = [
+            ("model", getattr(cfg, "model", "?")),
+            ("provider", provider),
+            ("mode", getattr(cfg, "policy_mode", "?")),
+            ("tools", str(len(self._exposed_tool_names()))),
+            ("workspace", str(self.workspace_root)),
+        ]
+        self._writeln(self.ui.banner("Forge - interactive agent", rows))
+        self._writeln("Type /help for commands, /exit to quit.\n")
+
+    def _exposed_tool_names(self) -> list[str]:
+        """Return the names of the tools currently exposed to the model."""
+        executor = getattr(self.agent_loop, "tool_executor", None)
+        specs = getattr(executor, "specs", None)
+        if callable(specs):
+            try:
+                return [s.name for s in specs()]
+            except Exception:  # noqa: BLE001
+                pass
+        if self.config is not None:
+            return list(getattr(self.config, "enabled_tools", []))
+        return []
+
+    def _render_tools(self) -> None:
+        """Render the list of tools currently available to the model."""
+        names = sorted(self._exposed_tool_names())
+        self._writeln("[tools] " + (", ".join(names) if names else "(none)"))
+
+    def _render_model(self) -> None:
+        """Render the active model, provider, and thinking level."""
+        if self.config is None:
+            self._writeln("[model] (unavailable)")
+            return
+        cfg = self.config
+        thinking = getattr(cfg, "provider_thinking_level", None)
+        suffix = f", thinking: {thinking}" if thinking else ""
+        self._writeln(
+            f"[model] {getattr(cfg, 'model', '?')} "
+            f"(provider: {getattr(cfg, 'provider_type', '?')}{suffix})"
+        )
+
+    def _render_cost(self) -> None:
+        """Render the cumulative session token usage and estimated cost."""
+        tracker = getattr(self.agent_loop, "usage_tracker", None)
+        summary = getattr(tracker, "turn_summary", None)
+        if not callable(summary):
+            self._writeln("[cost] usage tracking unavailable")
+            return
+        u = summary()
+        tokens = (
+            f"{_fmt_tokens(u.cumulative_input_tokens)} in / "
+            f"{_fmt_tokens(u.cumulative_output_tokens)} out"
+        )
+        if u.cost_available and u.cumulative_cost is not None:
+            self._writeln(f"[cost] session: {tokens} | ${u.cumulative_cost:.6f}")
+        else:
+            self._writeln(f"[cost] session: {tokens} | cost unavailable")
 
     # -- todo rendering / change detection -----------------------------------
 

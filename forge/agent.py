@@ -54,6 +54,7 @@ from forge.session import (
 from forge.tools.base import ToolExecutor, ToolResult
 from forge.usage import UsageSummary, UsageTracker
 from forge.providers import Done, TextDelta, UsageReport, Provider, ProviderError
+from forge.ui import summarize_result
 
 __all__ = ["Renderer", "NullRenderer", "TurnResult", "AgentLoop"]
 
@@ -78,8 +79,12 @@ class Renderer(Protocol):
         """Render a streamed fragment of model text."""
         ...
 
-    def on_tool(self, name: str) -> None:
-        """Announce that the named tool is about to be invoked (Req 3.2)."""
+    def on_tool(self, name: str, args: dict | None = None) -> None:
+        """Announce that the named tool is about to be invoked (Req 3.2).
+
+        ``args`` carries the tool call's arguments so a renderer can describe
+        *what* the tool is doing (the target path, command, pattern, etc.).
+        """
         ...
 
     def on_compaction(self, info: CompactionInfo) -> None:
@@ -93,16 +98,19 @@ class Renderer(Protocol):
         denied: bool,
         forbidden: bool,
         diff: str | None,
+        ok: bool = True,
+        summary: str | None = None,
     ) -> None:
         """Render a post-execution notice for a single tool result (Phase 2).
 
         Called by the loop after a tool result is appended to the session so a
-        renderer can surface ``[denied]`` / ``[forbidden]`` notices and
-        optionally display the unified diff under the ``show_diffs`` config.
-        ``denied`` and ``forbidden`` come from the approval policy; ``diff``
-        is the ``meta["diff"]`` of a successful write/edit when the tool
-        provided one. The hook is optional — renderers that do not implement
-        it are silently skipped.
+        renderer can surface ``[denied]`` / ``[forbidden]`` notices, a concise
+        success ``summary`` (e.g. ``"42 lines"``), a failure message when
+        ``ok`` is ``False``, and optionally display the unified diff under the
+        ``show_diffs`` config. ``denied`` and ``forbidden`` come from the
+        approval policy; ``diff`` is the ``meta["diff"]`` of a successful
+        write/edit when the tool provided one. The hook is optional — renderers
+        that do not implement it are silently skipped.
         """
         ...
 
@@ -117,14 +125,15 @@ class NullRenderer:
     def on_text(self, text: str) -> None:  # noqa: D102 - no-op
         return None
 
-    def on_tool(self, name: str) -> None:  # noqa: D102 - no-op
+    def on_tool(self, name: str, args: dict | None = None) -> None:  # noqa: D102 - no-op
         return None
 
     def on_compaction(self, info: CompactionInfo) -> None:  # noqa: D102 - no-op
         return None
 
     def on_tool_result(self, name: str, *, denied: bool, forbidden: bool,
-                       diff: str | None) -> None:  # noqa: D102 - no-op
+                       diff: str | None, ok: bool = True,
+                       summary: str | None = None) -> None:  # noqa: D102 - no-op
         return None
 
 
@@ -153,6 +162,10 @@ class TurnResult:
             File_Mutation -- a :class:`ToolResult` with ``ok=True`` from a tool
             named ``write`` or ``edit``. The Verification_Phase reads this as
             the ``on_file_change`` trigger signal (Req 3.1, 3.2).
+        budget_exceeded: ``True`` when a configured cap (``max_iterations`` /
+            ``max_cost``) stopped the loop while the model still wanted to
+            continue (its last response emitted tool calls). Headless runs map
+            this to a dedicated exit code so a CI budget overrun is observable.
     """
 
     usage: UsageSummary
@@ -160,6 +173,7 @@ class TurnResult:
     error: str | None = None
     interrupted: bool = False
     mutated_files: bool = False
+    budget_exceeded: bool = False
 
 
 # --------------------------------------------------------------------------- #
@@ -210,6 +224,7 @@ class AgentLoop:
         parallel_max_workers: int = 4,
         vertex_client: Provider | None = None,
         max_iterations: int | None = None,
+        max_cost: float | None = None,
     ) -> None:
         self.context_manager = context_manager
         self.provider = provider or vertex_client
@@ -226,6 +241,11 @@ class AgentLoop:
         # None means unlimited (the interactive/main loop). Subagents pass a
         # finite value so their bounded-turn contract is actually enforced.
         self.max_iterations = max_iterations
+        # Optional cumulative-cost budget (USD). None means no cost cap. Used by
+        # headless runs (--max-cost) to stop before starting another model
+        # round-trip once the estimated cost crosses the budget. Only effective
+        # when model pricing is configured (otherwise cost is unavailable).
+        self.max_cost = max_cost
 
     # -- public API ----------------------------------------------------------
 
@@ -244,6 +264,7 @@ class AgentLoop:
         error: str | None = None
         interrupted = False
         mutated_files = False
+        budget_exceeded = False
         iterations = 0
 
         # The agent loop owns the turn boundary: begin_turn clears any stale
@@ -261,13 +282,33 @@ class AgentLoop:
                     interrupted = True
                     break
 
-                # Bounded-turn cap (subagents). None => unlimited. Each loop
-                # iteration is one model round-trip; stop once the cap is hit.
+                # Bounded-turn cap (subagents / headless --max-turns). None =>
+                # unlimited. Each loop iteration is one model round-trip; stop
+                # once the cap is hit. Reaching this check means the previous
+                # iteration emitted tool calls (otherwise the loop already broke
+                # on "no tool calls"), so the model wanted to continue -> flag a
+                # budget stop.
                 if (
                     self.max_iterations is not None
                     and iterations >= self.max_iterations
                 ):
+                    budget_exceeded = True
                     break
+
+                # Cost budget (headless --max-cost). Checked before starting the
+                # next round-trip so we never begin a request that would push
+                # spend past the budget. Only effective when pricing is
+                # configured (cost_available); otherwise cumulative_cost is None
+                # and this never trips.
+                if self.max_cost is not None:
+                    summary = self.usage_tracker.turn_summary()
+                    if (
+                        summary.cost_available
+                        and summary.cumulative_cost is not None
+                        and summary.cumulative_cost >= self.max_cost
+                    ):
+                        budget_exceeded = True
+                        break
                 iterations += 1
 
                 # (a) Assemble context; keep the FIRST compaction info to
@@ -339,6 +380,7 @@ class AgentLoop:
             error=error,
             interrupted=interrupted,
             mutated_files=mutated_files,
+            budget_exceeded=budget_exceeded,
         )
 
     # -- streaming -----------------------------------------------------------
@@ -347,10 +389,10 @@ class AgentLoop:
         """Consume one model response stream into accumulated text + tool calls.
 
         Renders text deltas (Req 3.1) and tool-name announcements (Req 3.2),
-        records per-response usage (Req 17.1), and polls the interrupt between
+        record per-response usage (Req 17.1), and polls the interrupt between
         events so an in-flight response stops promptly (Req 4.5). A typed
-        :class:`~forge.vertex.VertexError` is captured (not raised) so the turn
-        can end gracefully with the partial text retained.
+        :class:`~forge.providers.ProviderError` is captured (not raised) so the
+        turn can end gracefully with the partial text retained.
 
         Token usage is recorded exactly once per response: ``usage_metadata``
         is reported as cumulative counts for the response and may appear on
@@ -394,7 +436,7 @@ class AgentLoop:
                     self._render_text(event.text)
                 elif isinstance(event, ToolCall):
                     tool_calls.append(event)
-                    self._render_tool(event.name)
+                    self._render_tool(event.name, event.args)
                 elif isinstance(event, UsageReport):
                     # Keep the latest cumulative report; record once below.
                     last_usage = event
@@ -405,7 +447,7 @@ class AgentLoop:
                 if self.interrupt.check():
                     outcome.interrupted = True
                     break
-        except VertexError as exc:
+        except ProviderError as exc:
             # Surface the error so the turn ends without losing session state
             # (Req 2.5, 2.6, 2.8); partial text already rendered is retained.
             outcome.error = str(exc) or exc.__class__.__name__
@@ -428,11 +470,12 @@ class AgentLoop:
             if not is_exposed_fn(call.name):
                 return False
 
-        registry = getattr(self.tool_executor, "_registry", None)
-        if registry is None:
-            return False
-
-        tool = registry.get(call.name)
+        get_tool = getattr(self.tool_executor, "get_tool", None)
+        if get_tool is not None:
+            tool = get_tool(call.name)
+        else:  # pragma: no cover - legacy executors without the accessor
+            registry = getattr(self.tool_executor, "_registry", None)
+            tool = registry.get(call.name) if registry is not None else None
         if tool is None:
             return False
 
@@ -589,10 +632,14 @@ class AgentLoop:
         if callable(hook):
             hook(text)
 
-    def _render_tool(self, name: str) -> None:
+    def _render_tool(self, name: str, args: dict | None = None) -> None:
         hook = getattr(self.renderer, "on_tool", None)
         if callable(hook):
-            hook(name)
+            try:
+                hook(name, args)
+            except TypeError:
+                # Renderer implements the older on_tool(name) signature only.
+                hook(name)
 
     def _render_compaction(self, info: CompactionInfo) -> None:
         hook = getattr(self.renderer, "on_compaction", None)
@@ -615,12 +662,23 @@ class AgentLoop:
         if not callable(hook):
             return
         meta = result.meta or {}
-        hook(
-            call.name,
-            denied=bool(meta.get("denied", False)),
-            forbidden=bool(meta.get("forbidden", False)),
-            diff=meta.get("diff") if isinstance(meta.get("diff"), str) else None,
-        )
+        denied = bool(meta.get("denied", False))
+        forbidden = bool(meta.get("forbidden", False))
+        diff = meta.get("diff") if isinstance(meta.get("diff"), str) else None
+        summary = summarize_result(call.name, result)
+        try:
+            hook(
+                call.name,
+                denied=denied,
+                forbidden=forbidden,
+                diff=diff,
+                ok=bool(result.ok),
+                summary=summary,
+            )
+        except TypeError:
+            # Renderer implements the older on_tool_result signature (without
+            # ok/summary); fall back so it still receives denial/diff info.
+            hook(call.name, denied=denied, forbidden=forbidden, diff=diff)
 
 
 # --------------------------------------------------------------------------- #

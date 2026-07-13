@@ -22,6 +22,7 @@ EXIT_OK = 0
 EXIT_TURN_ERROR = 2
 EXIT_INTERRUPTED = 3
 EXIT_VERIFICATION_FAILED = 4
+EXIT_BUDGET_EXCEEDED = 5
 
 
 class _CapturingRenderer:
@@ -37,9 +38,13 @@ class _CapturingRenderer:
             self._echo.write(text)
             self._echo.flush()
 
-    def on_tool(self, name: str) -> None:
+    def on_tool(self, name: str, args: dict | None = None) -> None:
         if self._echo is not None:
-            self._echo.write(f"\n[tool: {name}]\n")
+            from forge.ui import describe_tool
+
+            detail = describe_tool(name, args)
+            line = f"\n[tool: {name}]" + (f" {detail}" if detail else "") + "\n"
+            self._echo.write(line)
             self._echo.flush()
 
     def on_compaction(self, info) -> None:  # noqa: ANN001 - matches Renderer
@@ -87,6 +92,8 @@ def run_headless(
     output: str = "text",
     out: TextIO,
     yes: bool = False,
+    max_turns: int | None = None,
+    max_cost: float | None = None,
 ) -> int:
     """Run one prompt to completion and render/serialize the result.
 
@@ -99,7 +106,18 @@ def run_headless(
     every gated call is auto-approved (matching the autopilot behavior);
     when ``False`` any gated mutation is denied so the run cannot hang on a
     prompt it cannot answer.
+
+    ``max_turns`` caps the number of model round-trips within the turn and
+    ``max_cost`` caps the cumulative estimated spend (USD); either cap stops the
+    loop early and yields :data:`EXIT_BUDGET_EXCEEDED`. Both are applied to the
+    shared :class:`~forge.agent.AgentLoop` for this run.
     """
+
+    # Apply the run's budgets to the agent loop before the turn starts.
+    if max_turns is not None:
+        agent_loop.max_iterations = max_turns
+    if max_cost is not None:
+        agent_loop.max_cost = max_cost
 
     # Wire the approver on the executor before the turn runs. The executor
     # is constructed without an approver at bootstrap time; the run path
@@ -126,7 +144,9 @@ def run_headless(
     agent_loop.renderer = NullRenderer()
 
     phase = None
-    turn_ok = not (result.interrupted or result.error)
+    # A budget-exceeded turn is not "ok": skip verification so we do not spend
+    # further tokens on correction turns after blowing the budget.
+    turn_ok = not (result.interrupted or result.error or result.budget_exceeded)
     if verification_coordinator is not None and turn_ok:
         phase = verification_coordinator.run(session, result)
 
@@ -145,6 +165,8 @@ def _exit_code(result: TurnResult, phase) -> int:
         return EXIT_TURN_ERROR
     if result.interrupted:
         return EXIT_INTERRUPTED
+    if result.budget_exceeded:
+        return EXIT_BUDGET_EXCEEDED
     if phase is not None and phase.ran and phase.final_result is not None:
         if phase.final_result.outcome != "passed":
             return EXIT_VERIFICATION_FAILED
@@ -179,6 +201,7 @@ def _emit_json(out, session, result, phase, usage, response_text, code) -> None:
         "response": response_text,
         "error": result.error,
         "interrupted": result.interrupted,
+        "budget_exceeded": result.budget_exceeded,
         "mutated_files": result.mutated_files,
         "usage": _usage_dict(usage),
         "verification": verification,
@@ -194,6 +217,8 @@ def _emit_text_footer(out, result, phase, usage) -> None:
         out.write(f"[error] {result.error}\n")
     elif result.interrupted:
         out.write("[interrupted]\n")
+    elif result.budget_exceeded:
+        out.write("[budget] stopped: run budget (max-turns/max-cost) reached\n")
     # Reuse the same usage wording as the REPL for consistency.
     tok = (
         f"turn: {usage.turn_input_tokens} in / {usage.turn_output_tokens} out | "

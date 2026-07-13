@@ -53,6 +53,7 @@ from __future__ import annotations
 
 import difflib
 import os
+import shutil
 import tempfile
 from pathlib import Path
 from typing import Any
@@ -430,6 +431,16 @@ class WriteTool:
             )
             with os.fdopen(fd, "wb") as handle:
                 handle.write(encoded)
+
+            # Preserve the existing file's permission bits (e.g. the exec bit)
+            # across the atomic replace. mkstemp creates the temp file 0600 and
+            # os.replace keeps that mode, so without this an existing script
+            # would silently lose its exec/group/other bits on every write.
+            if resolved.exists():
+                try:
+                    shutil.copymode(resolved, tmp_path)
+                except OSError:
+                    pass
 
             os.replace(tmp_path, resolved)
             tmp_path = None  # replaced successfully; nothing to clean up
@@ -905,6 +916,15 @@ class EditTool:
             )
             with os.fdopen(fd, "wb") as handle:
                 handle.write(encoded)
+
+            # Preserve the existing file's permission bits across the atomic
+            # replace (mkstemp creates the temp file 0600; without this an edit
+            # would strip an existing script's exec bit). The edit target always
+            # exists here (it was read above), so copymode always applies.
+            try:
+                shutil.copymode(resolved, tmp_path)
+            except OSError:
+                pass
 
             os.replace(tmp_path, resolved)
             tmp_path = None

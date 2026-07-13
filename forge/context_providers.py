@@ -100,7 +100,7 @@ class MemoryProvider:
     def _latest_user_text(session: Session) -> str:
         """Scan session.messages in reverse for the last user message text."""
         for msg in reversed(session.messages):
-            if msg.role == "user" and msg.text.strip():
+            if msg.role == "user" and msg.text and msg.text.strip():
                 return msg.text.strip()
         return ""
 
