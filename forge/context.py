@@ -29,7 +29,7 @@ import warnings
 from dataclasses import dataclass, field
 from importlib import resources
 from pathlib import Path
-from typing import Callable
+from typing import Callable, Protocol, runtime_checkable
 
 from .config import Config
 from .session import Message, Session
@@ -54,6 +54,30 @@ PER_MESSAGE_OVERHEAD_TOKENS = 4
 # The package and resource name of the bundled built-in default system prompt.
 _DATA_PACKAGE = "forge.data"
 _SYSTEM_PROMPT_RESOURCE = "system_prompt.md"
+
+# --------------------------------------------------------------------------- #
+# Context-provider seam
+# --------------------------------------------------------------------------- #
+
+# Per-project instruction files auto-loaded as system context (Feature E).
+DEFAULT_PROJECT_MEMORY_FILES: tuple[str, ...] = ("FORGE.md", "AGENTS.md")
+
+
+@runtime_checkable
+class ContextProvider(Protocol):
+    """Supplies ephemeral, non-persisted segments appended to the context window.
+
+    A provider is consulted once per :meth:`ContextManager.assemble`. It returns
+    zero or more wire-shape message dicts (``{"role": ..., "content": ...}``)
+    that are appended to the *assembled window only* — they are never written to
+    ``session.messages`` and therefore never persisted. Returning an empty list
+    means "nothing to add this turn", which must leave the window byte-identical
+    to the no-provider case.
+    """
+
+    def segments(self, session: "Session") -> list[dict]:
+        ...
+
 
 # --------------------------------------------------------------------------- #
 # Compaction constants
@@ -266,9 +290,15 @@ class ContextManager:
         self,
         config: Config,
         summarizer: Callable[[list[dict]], str] | object | None = None,
+        providers: "list[ContextProvider] | None" = None,
+        workspace_root: "Path | None" = None,
+        project_memory_filenames: "tuple[str, ...]" = (),
     ) -> None:
         self.config = config
         self.summarizer = summarizer
+        self.providers = list(providers) if providers else []
+        self.workspace_root = workspace_root
+        self.project_memory_filenames = tuple(project_memory_filenames)
 
     # ----- System-prompt assembly (Req 15.1-15.4, Property 22) ----- #
 
@@ -294,6 +324,8 @@ class ContextManager:
                 continue
             segments.append(path.read_text(encoding="utf-8"))
 
+        # Feature E: auto-load a per-project instruction file from the workspace.
+        segments.extend(self._project_memory_segments())
         return segments
 
     def build_system_prompt(self) -> str:
@@ -345,11 +377,15 @@ class ContextManager:
         """Assemble the Context_Window for a turn, compacting if over limit.
 
         Builds the system messages (built-in default prompt first, then steering
-        files in order) followed by the session's conversation messages. The
-        estimated token count of that window is computed with the deterministic
-        offline heuristic (Req 14.1). When it is at or below
-        ``config.token_limit`` the window is returned as-is with ``None`` for the
-        compaction info (Req 14.2, 14.8).
+        files in order, then any project memory file) followed by the session's
+        conversation messages. The estimated token count of that window is
+        computed with the deterministic offline heuristic (Req 14.1). When it is
+        at or below the effective token limit the window is returned as-is with
+        ``None`` for the compaction info (Req 14.2, 14.8).
+
+        Ephemeral provider segments (e.g. the plan reminder) are appended after
+        compaction; their token cost is reserved so the final window still fits
+        the configured limit. They are never written to ``session.messages``.
 
         When the estimate exceeds the limit, :meth:`compact` is run before the
         window is returned: the middle region is summarized and, if still over
@@ -359,16 +395,59 @@ class ContextManager:
         "conversation context was compacted" notice (Req 14.7).
         """
 
-        window: list[dict] = self.assemble_system_messages()
-        window.extend(_message_to_window_dict(m) for m in session.messages)
+        base: list[dict] = self.assemble_system_messages()
+        base.extend(_message_to_window_dict(m) for m in session.messages)
 
-        if self.estimate_tokens(window) <= self.config.token_limit:
-            return window, None
+        # Ephemeral, non-persisted provider segments (e.g. the plan reminder).
+        ephemeral = self._provider_segments(session)
+        reserve = self.estimate_tokens(ephemeral) if ephemeral else 0
+        # Never let the reservation drive the effective limit below a small floor.
+        effective_limit = max(self.config.token_limit - reserve, 0)
 
-        result = self.compact(session)
-        return result.messages, result.info
+        if self.estimate_tokens(base) <= effective_limit:
+            return base + ephemeral, None
 
-    def compact(self, session: Session) -> CompactionResult:
+        result = self.compact(session, limit=effective_limit)
+        return result.messages + ephemeral, result.info
+
+    def _provider_segments(self, session: Session) -> list[dict]:
+        """Collect ephemeral segments from all providers, in registration order."""
+        segments: list[dict] = []
+        for provider in self.providers:
+            try:
+                produced = provider.segments(session)
+            except Exception:  # noqa: BLE001 - a bad provider must never break a turn
+                produced = []
+            if produced:
+                segments.extend(produced)
+        return segments
+
+    def _project_memory_segments(self) -> list[str]:
+        """Return the contents of the first existing project memory file, or [].
+
+        Looks in ``self.workspace_root`` (only) for the configured filenames in
+        priority order (default: FORGE.md then AGENTS.md). Discovery is disabled
+        when ``workspace_root`` is None or no filenames are configured, which
+        reproduces the pre-feature behavior. A file that exists but cannot be
+        read or is not valid UTF-8 is warned about and skipped.
+        """
+        if self.workspace_root is None or not self.project_memory_filenames:
+            return []
+        for filename in self.project_memory_filenames:
+            candidate = self.workspace_root / filename
+            if not candidate.is_file():
+                continue
+            try:
+                return [candidate.read_text(encoding="utf-8")]
+            except (OSError, UnicodeDecodeError):
+                warnings.warn(
+                    f"Project memory file could not be read: {candidate}; skipping it.",
+                    stacklevel=2,
+                )
+                return []
+        return []
+
+    def compact(self, session: Session, *, limit: int | None = None) -> CompactionResult:
         """Compact the session's Context_Window to fit within the token limit.
 
         Partitions the conversation (NOT the system/steering prompt, which is
@@ -398,13 +477,13 @@ class ContextManager:
         system_messages = self.assemble_system_messages()
         conv = [_message_to_window_dict(m) for m in session.messages]
         n = len(conv)
-        limit = self.config.token_limit
+        effective_limit = self.config.token_limit if limit is None else limit
 
         # Degenerate case: no conversation messages. Nothing to partition; the
         # system prompt alone is the smallest window we can produce.
         if n == 0:
             window = list(system_messages)
-            if self.estimate_tokens(window) > limit:
+            if self.estimate_tokens(window) > effective_limit:
                 self._warn_cannot_reduce()
             return CompactionResult(
                 messages=window, info=CompactionInfo(occurred=True)
@@ -463,7 +542,7 @@ class ContextManager:
         # Drop retained-recent messages oldest-first until at/below the limit
         # or nothing droppable remains (Req 14.8, 14.9).
         dropped = 0
-        while self.estimate_tokens(window) > limit:
+        while self.estimate_tokens(window) > effective_limit:
             idx = next(
                 (k for k, item in enumerate(entries) if item["droppable"]), None
             )
@@ -475,7 +554,7 @@ class ContextManager:
 
         # Smallest well-formed window still exceeds the limit: warn and proceed
         # with what we have (Req 14.9).
-        if self.estimate_tokens(window) > limit:
+        if self.estimate_tokens(window) > effective_limit:
             self._warn_cannot_reduce()
 
         info = CompactionInfo(
@@ -547,10 +626,28 @@ class ContextManager:
         summarizer = self.summarizer
         if summarizer is None:
             return self._local_summary(middle)
-        if hasattr(summarizer, "generate_stream"):
-            return self._summarize_via_vertex(summarizer, middle)
-        if callable(summarizer):
-            return summarizer(middle)
+
+        # Summarization issues one or more live model requests (several, for a
+        # chunked large middle region). Any failure here — a rate limit, auth,
+        # timeout, or other VertexError, or a raising callable summarizer — must
+        # NOT crash the turn: compaction is invoked from inside AgentLoop.run_turn
+        # outside its VertexError handling, so an escaping exception would abort
+        # the whole turn and lose the graceful-degradation contract. Fall back to
+        # the deterministic local placeholder summary instead, emitting a warning
+        # so the degradation is observable. (Kept decoupled from forge.vertex by
+        # catching broadly rather than importing VertexError.)
+        try:
+            if hasattr(summarizer, "generate_stream"):
+                return self._summarize_via_vertex(summarizer, middle)
+            if callable(summarizer):
+                return summarizer(middle)
+        except Exception:  # noqa: BLE001 - summarization must never crash a turn
+            warnings.warn(
+                "Context summarization failed; falling back to a local "
+                "placeholder summary so the turn can proceed.",
+                stacklevel=2,
+            )
+            return self._local_summary(middle)
         return self._local_summary(middle)
 
     def _summarize_via_vertex(self, client: object, middle: list[dict]) -> str:

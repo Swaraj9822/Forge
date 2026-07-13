@@ -38,7 +38,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Protocol, runtime_checkable
+from typing import Any, Protocol, runtime_checkable
 
 from forge.context import CompactionInfo, ContextManager
 from forge.interrupt import InterruptController
@@ -53,7 +53,7 @@ from forge.session import (
 )
 from forge.tools.base import ToolExecutor, ToolResult
 from forge.usage import UsageSummary, UsageTracker
-from forge.vertex import Done, TextDelta, UsageReport, VertexClient, VertexError
+from forge.providers import Done, TextDelta, UsageReport, Provider, ProviderError
 
 __all__ = ["Renderer", "NullRenderer", "TurnResult", "AgentLoop"]
 
@@ -86,6 +86,26 @@ class Renderer(Protocol):
         """Render the context-compaction notice (Req 14.7)."""
         ...
 
+    def on_tool_result(
+        self,
+        name: str,
+        *,
+        denied: bool,
+        forbidden: bool,
+        diff: str | None,
+    ) -> None:
+        """Render a post-execution notice for a single tool result (Phase 2).
+
+        Called by the loop after a tool result is appended to the session so a
+        renderer can surface ``[denied]`` / ``[forbidden]`` notices and
+        optionally display the unified diff under the ``show_diffs`` config.
+        ``denied`` and ``forbidden`` come from the approval policy; ``diff``
+        is the ``meta["diff"]`` of a successful write/edit when the tool
+        provided one. The hook is optional — renderers that do not implement
+        it are silently skipped.
+        """
+        ...
+
 
 class NullRenderer:
     """A renderer that discards all output (the default).
@@ -101,6 +121,10 @@ class NullRenderer:
         return None
 
     def on_compaction(self, info: CompactionInfo) -> None:  # noqa: D102 - no-op
+        return None
+
+    def on_tool_result(self, name: str, *, denied: bool, forbidden: bool,
+                       diff: str | None) -> None:  # noqa: D102 - no-op
         return None
 
 
@@ -165,25 +189,43 @@ class AgentLoop:
     renderer:
         Optional :class:`Renderer` for streamed text, tool announcements, and
         the compaction notice. Defaults to a no-op :class:`NullRenderer`.
+    checkpoint:
+        Optional :class:`~forge.checkpoint.CheckpointStore`. When supplied,
+        :meth:`run_turn` brackets the turn with ``begin_turn`` / ``commit_turn``
+        so :meth:`~forge.checkpoint.CheckpointStore.undo_last` reverts the
+        most recent turn's file mutations.
     """
 
     def __init__(
         self,
         context_manager: ContextManager,
-        vertex_client: VertexClient,
-        tool_executor: ToolExecutor,
-        usage_tracker: UsageTracker,
-        session_store: SessionStore,
-        interrupt: InterruptController,
+        provider: Provider | None = None,
+        tool_executor: ToolExecutor | None = None,
+        usage_tracker: UsageTracker | None = None,
+        session_store: SessionStore | None = None,
+        interrupt: InterruptController | None = None,
         renderer: Renderer | None = None,
+        checkpoint: Any | None = None,
+        parallel_enabled: bool = False,
+        parallel_max_workers: int = 4,
+        vertex_client: Provider | None = None,
+        max_iterations: int | None = None,
     ) -> None:
         self.context_manager = context_manager
-        self.vertex_client = vertex_client
+        self.provider = provider or vertex_client
+        self.vertex_client = self.provider
         self.tool_executor = tool_executor
         self.usage_tracker = usage_tracker
         self.session_store = session_store
         self.interrupt = interrupt
+        self.checkpoint = checkpoint
         self.renderer: Renderer = renderer or NullRenderer()
+        self.parallel_enabled = bool(parallel_enabled)
+        self.parallel_max_workers = int(parallel_max_workers)
+        # Optional cap on the number of model round-trips within a single turn.
+        # None means unlimited (the interactive/main loop). Subagents pass a
+        # finite value so their bounded-turn contract is actually enforced.
+        self.max_iterations = max_iterations
 
     # -- public API ----------------------------------------------------------
 
@@ -202,17 +244,31 @@ class AgentLoop:
         error: str | None = None
         interrupted = False
         mutated_files = False
+        iterations = 0
 
         # The agent loop owns the turn boundary: begin_turn clears any stale
         # interrupt and arms the SIGINT handler to trip the shared event;
         # end_turn reverts to the idle no-op once the turn is over.
+        # Phase 2: when a checkpoint store is wired, begin/commit brackets the
+        # turn body so /undo restores whole turns, not individual tool calls.
         self.usage_tracker.begin_turn()
         self.interrupt.begin_turn()
+        if self.checkpoint is not None:
+            self.checkpoint.begin_turn()
         try:
             while True:
                 if self.interrupt.check():
                     interrupted = True
                     break
+
+                # Bounded-turn cap (subagents). None => unlimited. Each loop
+                # iteration is one model round-trip; stop once the cap is hit.
+                if (
+                    self.max_iterations is not None
+                    and iterations >= self.max_iterations
+                ):
+                    break
+                iterations += 1
 
                 # (a) Assemble context; keep the FIRST compaction info to
                 # surface on the result (Req 14.7).
@@ -259,6 +315,8 @@ class AgentLoop:
                 # the model (Req 1.5).
         finally:
             self.interrupt.end_turn()
+            if self.checkpoint is not None:
+                self.checkpoint.commit_turn()
 
         # Persist the session once the turn ends, whatever the outcome
         # (completed, interrupted, or errored): all appended messages and
@@ -307,7 +365,26 @@ class AgentLoop:
 
         try:
             specs = self.tool_executor.specs()
-            for event in self.vertex_client.generate_stream(contents, specs):
+            stream = self.provider.generate_stream(contents, specs)
+
+            status_hook = getattr(self.renderer, "status", None)
+            first_event = None
+            if status_hook is not None:
+                with status_hook("Waiting for model response..."):
+                    try:
+                        first_event = next(stream)
+                    except StopIteration:
+                        pass
+            else:
+                try:
+                    first_event = next(stream)
+                except StopIteration:
+                    pass
+
+            import itertools
+            events = [first_event] if first_event is not None else []
+
+            for event in itertools.chain(events, stream):
                 if self.interrupt.check():
                     outcome.interrupted = True
                     break
@@ -344,6 +421,25 @@ class AgentLoop:
 
     # -- tool execution ------------------------------------------------------
 
+    def _parallel_eligible(self, call: ToolCall) -> bool:
+        """Return True if the call is eligible for parallel execution."""
+        is_exposed_fn = getattr(self.tool_executor, "is_exposed", None)
+        if is_exposed_fn is not None:
+            if not is_exposed_fn(call.name):
+                return False
+
+        registry = getattr(self.tool_executor, "_registry", None)
+        if registry is None:
+            return False
+
+        tool = registry.get(call.name)
+        if tool is None:
+            return False
+
+        read_only = getattr(tool, "read_only", False)
+        safe_set = {"read", "search", "search_memory", "repo_index"}
+        return bool(read_only) and (call.name in safe_set)
+
     def _execute_tool_calls(
         self, session: Session, calls: list[ToolCall]
     ) -> "_ToolBatchOutcome":
@@ -358,23 +454,58 @@ class AgentLoop:
         already executed keep their appended Tool_Results.
         """
         mutated_files = False
-        for call in calls:
+        lead = []
+        i = 0
+        while i < len(calls) and self._parallel_eligible(calls[i]):
+            lead.append(calls[i])
+            i += 1
+
+        lead_results = []
+        interrupted = False
+
+        if len(lead) > 1 and self.parallel_enabled:
             if self.interrupt.check():
-                return _ToolBatchOutcome(
-                    interrupted=True, mutated_files=mutated_files
-                )
-            result = self.tool_executor.execute(call)
-            # A successful write/edit is a File_Mutation; flag the batch so the
-            # turn surfaces it for the on_file_change verification trigger.
+                return _ToolBatchOutcome(interrupted=True, mutated_files=False)
+
+            import concurrent.futures
+
+            futures = []
+            with concurrent.futures.ThreadPoolExecutor(
+                max_workers=self.parallel_max_workers
+            ) as executor:
+                for call in lead:
+                    futures.append(
+                        executor.submit(self.tool_executor.execute, call)
+                    )
+
+                for fut in futures:
+                    if self.interrupt.check():
+                        interrupted = True
+                        break
+                    try:
+                        res = fut.result()
+                    except Exception as exc:
+                        res = ToolResult(ok=False, content="", error=str(exc))
+                    lead_results.append(res)
+                    if self.interrupt.check():
+                        interrupted = True
+                        break
+        else:
+            for call in lead:
+                if self.interrupt.check():
+                    interrupted = True
+                    break
+                res = self.tool_executor.execute(call)
+                lead_results.append(res)
+                if self.interrupt.check():
+                    interrupted = True
+                    break
+
+        for call, result in zip(lead[:len(lead_results)], lead_results):
             if result.ok and call.name in ("write", "edit"):
                 mutated_files = True
-            # Mirror any todo-list state the tool reports (e.g. the planning
-            # tool, which keeps its list in the shared ToolContext.state) onto
-            # the session so the REPL renders it (Req 10.3) and it persists
-            # across turns (Req 10.5). The tool exposes its authoritative list
-            # via meta["todos"]; syncing here keeps the loop decoupled from the
-            # ToolContext internals.
             self._sync_todos(session, result)
+            self._maybe_record_subagent_usage(result)
             session.messages.append(
                 Message(
                     role="tool",
@@ -382,7 +513,35 @@ class AgentLoop:
                     tool_result=_to_record(call, result),
                 )
             )
-        return _ToolBatchOutcome(interrupted=False, mutated_files=mutated_files)
+            self._render_tool_result(call, result)
+
+        if interrupted:
+            return _ToolBatchOutcome(
+                interrupted=True, mutated_files=mutated_files
+            )
+
+        for call in calls[len(lead):]:
+            if self.interrupt.check():
+                return _ToolBatchOutcome(
+                    interrupted=True, mutated_files=mutated_files
+                )
+            result = self.tool_executor.execute(call)
+            if result.ok and call.name in ("write", "edit"):
+                mutated_files = True
+            self._sync_todos(session, result)
+            self._maybe_record_subagent_usage(result)
+            session.messages.append(
+                Message(
+                    role="tool",
+                    text=None,
+                    tool_result=_to_record(call, result),
+                )
+            )
+            self._render_tool_result(call, result)
+
+        return _ToolBatchOutcome(
+            interrupted=False, mutated_files=mutated_files
+        )
 
     @staticmethod
     def _sync_todos(session: Session, result: ToolResult) -> None:
@@ -402,6 +561,27 @@ class AgentLoop:
             for t in todos
         ]
 
+    def _maybe_record_subagent_usage(self, result: ToolResult) -> None:
+        """Fold a subagent's token usage into this turn's usage tracker.
+
+        The ``delegate`` tool runs a nested agent loop with its own usage
+        tracker and reports the delegated token counts under
+        ``meta["subagent_usage"]``. Recording them here makes the parent turn's
+        (and session's) usage and cost include the delegated work, rather than
+        siloing it in the subagent (Phase 5, Feature N usage aggregation).
+        """
+        usage = (result.meta or {}).get("subagent_usage")
+        if not isinstance(usage, dict):
+            return
+        try:
+            self.usage_tracker.record(
+                int(usage.get("input_tokens", 0)),
+                int(usage.get("output_tokens", 0)),
+            )
+        except (TypeError, ValueError):
+            # Malformed usage meta must never break the turn.
+            return
+
     # -- renderer hooks (defensively guarded) --------------------------------
 
     def _render_text(self, text: str) -> None:
@@ -418,6 +598,29 @@ class AgentLoop:
         hook = getattr(self.renderer, "on_compaction", None)
         if callable(hook):
             hook(info)
+
+    def _render_tool_result(self, call: ToolCall, result: ToolResult) -> None:
+        """Render a post-execution notice for a single tool result (Phase 2).
+
+        Forwards ``(name, denied, forbidden, diff)`` to the renderer's
+        :meth:`Renderer.on_tool_result` hook when present. ``denied`` and
+        ``forbidden`` come from the result's ``meta`` (set by the executor
+        when the policy refuses the call); ``diff`` is the tool-provided
+        ``meta["diff"]`` of a successful write/edit, or ``None`` when the
+        tool did not supply one. The hook is optional: renderers that do
+        not implement it are silently skipped.
+        """
+
+        hook = getattr(self.renderer, "on_tool_result", None)
+        if not callable(hook):
+            return
+        meta = result.meta or {}
+        hook(
+            call.name,
+            denied=bool(meta.get("denied", False)),
+            forbidden=bool(meta.get("forbidden", False)),
+            diff=meta.get("diff") if isinstance(meta.get("diff"), str) else None,
+        )
 
 
 # --------------------------------------------------------------------------- #

@@ -165,3 +165,27 @@ def test_check_adc_skipped_when_auth_library_unavailable(monkeypatch) -> None:
 
     # The check defers to the VertexClient's request-time credential check.
     assert check_adc() is None
+
+
+def test_validate_required_config_anthropic_and_openai(monkeypatch: pytest.MonkeyPatch) -> None:
+    # 1. Anthropic passes when key present in env
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "fake")
+    config_ant = Config(provider_type="anthropic")
+    assert validate_required_config(config_ant) is None
+
+    # Raises when missing
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    with pytest.raises(StartupError) as excinfo:
+        validate_required_config(config_ant)
+    assert "ANTHROPIC_API_KEY" in excinfo.value.message
+
+    # 2. OpenAI passes when key present in env
+    monkeypatch.setenv("OPENAI_API_KEY", "fake")
+    config_oa = Config(provider_type="openai")
+    assert validate_required_config(config_oa) is None
+
+    # Raises when missing
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    with pytest.raises(StartupError) as excinfo:
+        validate_required_config(config_oa)
+    assert "OPENAI_API_KEY" in excinfo.value.message

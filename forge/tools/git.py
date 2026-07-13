@@ -90,6 +90,10 @@ class GitTool:
         "args=['--oneline', '-n', '5']). Returns the command output; on a "
         "non-zero exit the exit code and error output are included."
     )
+    # Git is conservatively non-read-only here; the approval policy applies a
+    # finer-grained per-operation rule (status/diff/log/show/branch are
+    # treated as read-only; add/commit/checkout/stash require approval).
+    read_only: bool = False
     parameters: dict = field(
         default_factory=lambda: {
             "type": "object",

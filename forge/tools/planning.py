@@ -110,6 +110,8 @@ class PlanningTool:
         "text, and a status of 'pending', 'in_progress', or 'completed'. The "
         "list persists across turns until it is replaced or cleared."
     )
+    # The todo list is session-internal; no external state changes.
+    read_only: bool = True
     parameters: dict = field(
         default_factory=lambda: {
             "type": "object",

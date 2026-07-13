@@ -14,12 +14,17 @@ dependencies = [
     "mcp",
     "tomli-w",
     "prompt_toolkit",
+    "rich",
 ]
 
 [project.optional-dependencies]
 dev = [
     "hypothesis",
     "pytest",
+]
+providers = [
+    "anthropic",
+    "openai",
 ]
 
 [project.scripts]

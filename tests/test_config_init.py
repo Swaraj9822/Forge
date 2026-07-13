@@ -90,6 +90,23 @@ def test_init_config_round_trip(subdir: str, filename: str) -> None:
         assert config.pricing.input_per_1k == DEFAULT_INIT_PRICING["input_per_1k"]
         assert config.pricing.output_per_1k == DEFAULT_INIT_PRICING["output_per_1k"]
 
+        # The [context] table is present and round-trips to the defaults.
+        assert parsed["context"] == {"plan_reminder": True, "project_memory": True}
+        assert config.plan_reminder is True
+        assert config.project_memory is True
+
+        # Phase 2: a freshly `forge init`-ed config opts the user into
+        # supervised mode (the safe default for new installs) and writes the
+        # [checkpoint] table with the documented retention cap.
+        assert parsed["policy"]["mode"] == "supervised"
+        assert parsed["policy"]["show_diffs"] is True
+        assert isinstance(parsed["policy"]["shell_allowlist"], list)
+        assert parsed["checkpoint"] == {"enabled": True, "keep_turns": 10}
+        assert config.policy_mode == "supervised"
+        assert config.show_diffs is True
+        assert config.checkpoint_enabled is True
+        assert config.checkpoint_keep_turns == 10
+
         # The required project/region placeholders survive the round-trip.
         assert config.project == PROJECT_PLACEHOLDER
         assert config.region == REGION_PLACEHOLDER

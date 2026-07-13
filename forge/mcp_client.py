@@ -187,6 +187,10 @@ class McpToolAdapter:
         self.description = description or ""
         self.parameters = parameters or {}
         self._client = client
+        # MCP tools have unknown side-effect surface; classify conservatively
+        # as non-read-only so the approval policy requires a prompt for them in
+        # supervised/readonly modes.
+        self.read_only = False
 
     def validate(self, args: dict) -> str | None:
         """Light shape check: arguments must be an object/mapping.

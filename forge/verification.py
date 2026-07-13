@@ -479,6 +479,10 @@ class VerificationCoordinator:
         self._interrupt = interrupt
         self._renderer = renderer
 
+    def set_renderer(self, renderer: "VerificationRenderer | None") -> None:
+        """Replace the progress renderer (used by the headless run path)."""
+        self._renderer = renderer
+
     def _run_verify(self) -> tuple[VerificationResult, bool]:
         """Run the Verify_Command once, bracketed for interrupt observation.
 
