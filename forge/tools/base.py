@@ -257,6 +257,20 @@ class ToolExecutor:
         """
         return self._registry.get(name)
 
+    @property
+    def registry(self) -> dict[str, Tool]:
+        """The ``name -> Tool`` registry (read-only accessor for collaborators).
+
+        Exposed so post-turn phases (e.g. the review agent) can build a
+        subagent over the same toolset without reaching into a private field.
+        """
+        return self._registry
+
+    @property
+    def context(self) -> ToolContext:
+        """The shared :class:`ToolContext` (read-only accessor for collaborators)."""
+        return self._context
+
     def specs(self) -> list[ToolSpec]:
         """Return a :class:`ToolSpec` for each exposed tool.
 
@@ -370,8 +384,24 @@ class ToolExecutor:
                 call.args.get("path"), self._context
             )
 
-        # 4. Run the tool.
-        result = tool.run(call.args, self._context)
+        # 4. Run the tool. An unexpected exception from a tool (a bug in a
+        # built-in, or anything a third-party/MCP tool raises) must not abort
+        # the agent loop: converting it into a structured failure result keeps
+        # the turn alive, ensures the session is still persisted, and makes the
+        # sequential and parallel execution paths behave identically.
+        # KeyboardInterrupt / SystemExit are intentionally allowed to propagate
+        # so Ctrl-C and interpreter shutdown are never swallowed.
+        try:
+            result = tool.run(call.args, self._context)
+        except (KeyboardInterrupt, SystemExit):
+            raise
+        except Exception as exc:  # noqa: BLE001 - convert to structured failure
+            return ToolResult(
+                ok=False,
+                content="",
+                error=f"Tool '{call.name}' raised an unexpected error: {exc}",
+                meta={"exception": True},
+            )
 
         # 5. Interrupt check after running.
         if self._interrupt.check():

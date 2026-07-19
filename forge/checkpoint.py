@@ -21,6 +21,7 @@ that the file cannot be restored. This bounds the worst-case snapshot cost.
 
 from __future__ import annotations
 
+import difflib
 import hashlib
 import json
 import os
@@ -338,6 +339,71 @@ class CheckpointStore:
         return restored
 
     # -- helpers ------------------------------------------------------------
+
+    def diff_last_turn(self) -> str:
+        """Return a unified diff of the most recent committed turn's changes.
+
+        For each file the turn touched, compares the pre-turn snapshot (the
+        "before" bytes captured by :meth:`snapshot_before`) against the file's
+        current content (the "after"), producing a ``git diff``-style unified
+        diff. A file the turn *created* (no prior snapshot) shows as an addition;
+        a deleted file shows as a removal. Record-only entries (a file too large
+        or unreadable to snapshot) are noted but not diffed.
+
+        Returns ``""`` when there is no committed turn to diff. This is
+        repo-independent (it uses the checkpoint snapshots, not git), so it works
+        even outside a git repository. It reflects only ``write`` / ``edit`` tool
+        mutations — changes made by arbitrary ``shell`` commands are not
+        snapshotted and therefore not shown.
+        """
+        turn_dir, manifest = self._latest_committed_turn()
+        if turn_dir is None or manifest is None:
+            return ""
+
+        parts: list[str] = []
+        for entry in manifest.get("entries", []):
+            path = entry.get("path")
+            if not isinstance(path, str):
+                continue
+            existed = entry.get("existed", False)
+            snapshot = entry.get("snapshot")
+
+            if existed and snapshot is None:
+                # Record-only entry (oversize / unreadable at snapshot time).
+                parts.append(f"# {path}: changed (not captured for diff)\n")
+                continue
+
+            old = ""
+            if existed and isinstance(snapshot, str):
+                try:
+                    old = Path(snapshot).read_bytes().decode("utf-8", "replace")
+                except OSError:
+                    old = ""
+
+            new = ""
+            target = Path(path)
+            if target.is_file():
+                try:
+                    new = target.read_bytes().decode("utf-8", "replace")
+                except OSError:
+                    new = ""
+
+            if old == new:
+                continue
+
+            diff = difflib.unified_diff(
+                old.splitlines(keepends=True),
+                new.splitlines(keepends=True),
+                fromfile=f"a/{path}",
+                tofile=f"b/{path}",
+            )
+            text = "".join(diff)
+            if text and not text.endswith("\n"):
+                text += "\n"
+            if text:
+                parts.append(text)
+
+        return "".join(parts)
 
     def _reset_turn_state(self) -> None:
         """Clear the in-memory per-turn state after commit/undo."""

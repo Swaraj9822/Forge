@@ -56,6 +56,7 @@ import asyncio
 import threading
 import warnings
 from concurrent.futures import Future as ConcurrentFuture
+from concurrent.futures import TimeoutError as FuturesTimeoutError
 from contextlib import AsyncExitStack
 from dataclasses import dataclass
 from typing import Iterable
@@ -235,8 +236,9 @@ class McpClient:
         skipped with a warning (Req 16.4).
     """
 
-    def __init__(self, connect_timeout_s: int = 30) -> None:
+    def __init__(self, connect_timeout_s: int = 30, call_timeout_s: int = 60) -> None:
         self._connect_timeout_s = connect_timeout_s
+        self._call_timeout_s = call_timeout_s
         self._loop: asyncio.AbstractEventLoop | None = None
         self._thread: threading.Thread | None = None
         # name -> live ClientSession (set once the server runner is ready).
@@ -343,7 +345,17 @@ class McpClient:
             future: ConcurrentFuture = asyncio.run_coroutine_threadsafe(
                 session.call_tool(tool, args or {}), self._loop
             )
-            result = future.result()
+            # Bound the wait so an MCP server that stops responding cannot
+            # freeze the whole agent turn. On timeout we cancel the pending
+            # future (best-effort; the coroutine may already be blocked in I/O)
+            # and surface a structured failure rather than blocking forever.
+            result = future.result(timeout=self._call_timeout_s)
+        except FuturesTimeoutError:
+            future.cancel()
+            return self._error_result(
+                f"MCP tool '{tool}' on server '{server}' timed out after "
+                f"{self._call_timeout_s}s.",
+            )
         except Exception as exc:  # noqa: BLE001 - surface as failure result
             return self._error_result(
                 f"MCP tool '{tool}' on server '{server}' failed: {exc}",

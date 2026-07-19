@@ -67,7 +67,19 @@ class SubAgentInterruptController:
 class SubAgentContextManager(ContextManager):
     """ContextManager for subagents, overriding the default system prompt."""
 
-    def __init__(self, config: Config, summarizer: Any, workspace_root: Path | None = None) -> None:
+    _DEFAULT_PROMPT = (
+        "You are a sub-agent helper for the main coding assistant. Your job is to perform "
+        "the requested scoped task, explore files/workspace as needed, and return a concise result. "
+        "Do not perform changes or writes unless explicitly permitted. Return only the final outcome."
+    )
+
+    def __init__(
+        self,
+        config: Config,
+        summarizer: Any,
+        workspace_root: Path | None = None,
+        system_prompt: str | None = None,
+    ) -> None:
         super().__init__(
             config,
             summarizer=summarizer,
@@ -75,13 +87,10 @@ class SubAgentContextManager(ContextManager):
             workspace_root=workspace_root,
             project_memory_filenames=(),
         )
+        self._system_prompt = system_prompt or self._DEFAULT_PROMPT
 
     def _system_segments(self) -> list[str]:
-        return [
-            "You are a sub-agent helper for the main coding assistant. Your job is to perform "
-            "the requested scoped task, explore files/workspace as needed, and return a concise result. "
-            "Do not perform changes or writes unless explicitly permitted. Return only the final outcome."
-        ]
+        return [self._system_prompt]
 
 
 class SubAgentRunner:
@@ -99,6 +108,7 @@ class SubAgentRunner:
         policy: Any = None,
         approver: Any = None,
         parent_context: Any = None,
+        system_prompt: str | None = None,
     ) -> None:
         self.provider = provider
         self.config = config
@@ -110,6 +120,7 @@ class SubAgentRunner:
         self.policy = policy
         self.approver = approver
         self.parent_context = parent_context
+        self.system_prompt = system_prompt
 
     def run(self, task: str, *, workspace_root: Path) -> SubAgentResult:
         """Run a scoped task to completion in an isolated session."""
@@ -146,6 +157,7 @@ class SubAgentRunner:
                 self.config,
                 summarizer=self.provider,
                 workspace_root=workspace_root,
+                system_prompt=self.system_prompt,
             )
 
             # Headless usage tracker

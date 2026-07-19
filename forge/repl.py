@@ -280,6 +280,9 @@ class Repl:
         self.out: TextIO = out if out is not None else sys.stdout
         self.prompt = prompt
         self.verification_coordinator = verification_coordinator
+        # Optional post-turn ReviewCoordinator (duck-typed). Wired by the
+        # bootstrap after construction; None disables the review phase.
+        self.review_coordinator: Any | None = None
         self.checkpoint = checkpoint
         self.show_diffs = bool(show_diffs)
         self.ui = ui or Ui(self.out, color=False, spinner=False)
@@ -457,6 +460,15 @@ class Repl:
             if phase.ran:
                 usage_override = phase.usage
 
+        # After verification, an independent review agent inspects the change
+        # against the plan and drives its own bounded correction loop. Its
+        # aggregated usage (which includes the reviewer's tokens) supersedes the
+        # verification usage for the summary when it ran.
+        if self.review_coordinator is not None and turn_ok:
+            review_phase = self.review_coordinator.run(self.session, result)
+            if review_phase.ran:
+                usage_override = review_phase.usage
+
         self._render_turn_result(result, usage_override=usage_override, elapsed=elapsed)
         return True
 
@@ -619,6 +631,34 @@ class Repl:
         self._writeln(
             f"[verify] iteration cap reached ({iterations}); "
             f"final status: {result.outcome}"
+        )
+
+    # -- ReviewRenderer hooks (driven by the ReviewCoordinator) --------------
+
+    def on_review_start(self) -> None:
+        """Announce that an independent review pass is starting."""
+        self._writeln("[review] reviewing the change...")
+
+    def on_review_result(self, result: Any) -> None:
+        """Render the review verdict and any findings."""
+        verdict = getattr(result, "verdict", "")
+        if verdict == "approved":
+            self._writeln("[review] approved")
+            return
+        findings = getattr(result, "findings", []) or []
+        self._writeln(f"[review] changes requested ({len(findings)} finding(s))")
+        for finding in findings:
+            self._writeln(f"    - {finding}")
+
+    def on_review_correction(self, iteration: int, max_iterations: int) -> None:
+        """Announce a starting review-correction iteration."""
+        self._writeln(f"[review] correction {iteration}/{max_iterations}")
+
+    def on_review_cap_reached(self, result: Any, iterations: int) -> None:
+        """Render the review cap-reached notice (changes still requested)."""
+        self._writeln(
+            f"[review] iteration cap reached ({iterations}); "
+            "changes still requested"
         )
 
     # -- post-turn rendering -------------------------------------------------

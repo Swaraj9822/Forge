@@ -60,6 +60,59 @@ __all__ = ["Renderer", "NullRenderer", "TurnResult", "AgentLoop"]
 
 
 # --------------------------------------------------------------------------- #
+# Degeneration (repetition-loop) detection
+# --------------------------------------------------------------------------- #
+
+#: Run the degeneration scan once per this many streamed characters.
+_DEGEN_SCAN_INTERVAL = 1000
+#: Only scan once the response has streamed at least this many characters, so a
+#: legitimately long-but-varied response is never inspected.
+_DEGEN_MIN_CHARS = 6000
+#: Size of the trailing window examined for a repeating unit.
+_DEGEN_WINDOW = 3000
+#: Longest repeating unit considered (a genuine loop repeats a short phrase).
+_DEGEN_MAX_UNIT = 80
+#: The repeated unit must contiguously cover at least this many trailing chars.
+_DEGEN_MIN_SPAN = 2000
+#: ...and repeat at least this many times. Both thresholds must hold, so only an
+#: egregious loop trips the guard -- ordinary prose and code never repeat a
+#: short unit verbatim for 2000+ contiguous characters.
+_DEGEN_MIN_REPEATS = 12
+
+
+def _looks_degenerate(text: str) -> bool:
+    """Return ``True`` when ``text`` ends in an egregious repetition loop.
+
+    Scans the trailing :data:`_DEGEN_WINDOW` characters for the shortest unit
+    (up to :data:`_DEGEN_MAX_UNIT` chars) that repeats contiguously at the very
+    end. The guard trips only when such a unit both spans at least
+    :data:`_DEGEN_MIN_SPAN` characters and repeats at least
+    :data:`_DEGEN_MIN_REPEATS` times -- a signature that legitimate model output
+    (prose, code, even structured data whose values vary row to row) does not
+    produce. Conservative by design: it favors false negatives over aborting a
+    valid response.
+    """
+
+    if len(text) < _DEGEN_MIN_CHARS:
+        return False
+    window = text[-_DEGEN_WINDOW:]
+    n = len(window)
+    for unit_len in range(1, _DEGEN_MAX_UNIT + 1):
+        unit = window[n - unit_len:]
+        if not unit.strip():
+            continue
+        repeats = 1
+        i = n - unit_len
+        while i - unit_len >= 0 and window[i - unit_len:i] == unit:
+            repeats += 1
+            i -= unit_len
+        span = repeats * unit_len
+        if span >= _DEGEN_MIN_SPAN and repeats >= _DEGEN_MIN_REPEATS:
+            return True
+    return False
+
+
+# --------------------------------------------------------------------------- #
 # Rendering protocol
 # --------------------------------------------------------------------------- #
 
@@ -404,6 +457,11 @@ class AgentLoop:
         tool_calls: list[ToolCall] = []
         outcome = _StreamOutcome(tool_calls=tool_calls)
         last_usage: UsageReport | None = None
+        stream: Any | None = None
+        # Characters of streamed text accumulated since the last degeneration
+        # scan; the scan is only run every _DEGEN_SCAN_INTERVAL chars to keep
+        # its cost negligible relative to streaming.
+        chars_since_degen_scan = 0
 
         try:
             specs = self.tool_executor.specs()
@@ -434,6 +492,23 @@ class AgentLoop:
                 if isinstance(event, TextDelta):
                     text_parts.append(event.text)
                     self._render_text(event.text)
+                    # Degeneration guard: a model can fall into a repetition
+                    # loop (e.g. "Let's write. Let's write. ...") and stream
+                    # indefinitely without ever emitting a tool call, burning
+                    # the whole idle-timeout budget and producing nothing. Once
+                    # enough text has accumulated, periodically check whether
+                    # the tail is a short unit repeated far beyond any
+                    # plausible legitimate output; if so, abort the stream and
+                    # end the turn gracefully with the partial text retained.
+                    chars_since_degen_scan += len(event.text)
+                    if chars_since_degen_scan >= _DEGEN_SCAN_INTERVAL:
+                        chars_since_degen_scan = 0
+                        if _looks_degenerate("".join(text_parts)):
+                            outcome.error = (
+                                "model output degenerated into a repetition "
+                                "loop; stream aborted"
+                            )
+                            break
                 elif isinstance(event, ToolCall):
                     tool_calls.append(event)
                     self._render_tool(event.name, event.args)
@@ -451,6 +526,16 @@ class AgentLoop:
             # Surface the error so the turn ends without losing session state
             # (Req 2.5, 2.6, 2.8); partial text already rendered is retained.
             outcome.error = str(exc) or exc.__class__.__name__
+        finally:
+            # Close the provider stream on any early exit (interrupt, degeneration
+            # abort, or error) so its underlying HTTP connection is released
+            # promptly rather than lingering until garbage collection.
+            close = getattr(stream, "close", None)
+            if callable(close):
+                try:
+                    close()
+                except Exception:  # noqa: BLE001 - best-effort cleanup
+                    pass
 
         # Record this response's usage exactly once (Req 17.1, 17.2).
         if last_usage is not None:

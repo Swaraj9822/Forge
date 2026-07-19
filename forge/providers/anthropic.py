@@ -137,9 +137,13 @@ class AnthropicProvider(Provider):
                 if self._interrupt.check():
                     return
 
+                # Inactivity (idle) timeout: trips only when no event has
+                # arrived for `request_timeout_s`; the deadline is reset after
+                # each received event so an actively streaming response is never
+                # killed mid-flight -- only a stalled stream is.
                 if time.monotonic() > deadline:
                     raise RequestTimeoutError(
-                        f"Anthropic request exceeded {self._config.request_timeout_s}s."
+                        f"Anthropic stream stalled for over {self._config.request_timeout_s}s."
                     )
 
                 try:
@@ -148,6 +152,9 @@ class AnthropicProvider(Provider):
                     break
                 except Exception as exc:
                     self._translate_and_raise(exc)
+
+                # An event arrived: reset the idle deadline.
+                deadline = time.monotonic() + self._config.request_timeout_s
 
                 event_type = getattr(event, "type", None)
 

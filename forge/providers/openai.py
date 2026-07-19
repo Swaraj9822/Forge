@@ -136,9 +136,13 @@ class OpenAIProvider(Provider):
                 if self._interrupt.check():
                     return
 
+                # Inactivity (idle) timeout: trips only when no chunk has
+                # arrived for `request_timeout_s`; the deadline is reset after
+                # each received chunk so an actively streaming response is never
+                # killed mid-flight -- only a stalled stream is.
                 if time.monotonic() > deadline:
                     raise RequestTimeoutError(
-                        f"OpenAI request exceeded {self._config.request_timeout_s}s."
+                        f"OpenAI stream stalled for over {self._config.request_timeout_s}s."
                     )
 
                 try:
@@ -147,6 +151,9 @@ class OpenAIProvider(Provider):
                     break
                 except Exception as exc:
                     self._translate_and_raise(exc)
+
+                # A chunk arrived: reset the idle deadline.
+                deadline = time.monotonic() + self._config.request_timeout_s
 
                 # 1. Parse top-level usage metadata if present
                 usage = getattr(chunk, "usage", None)

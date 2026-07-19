@@ -305,3 +305,44 @@ def test_multiple_files_in_one_turn(tmp_path: Path) -> None:
     assert restored == sorted([str(a.resolve()), str(b.resolve())])
     assert a.read_text(encoding="utf-8") == "A1"
     assert b.read_text(encoding="utf-8") == "B1"
+
+
+# --------------------------------------------------------------------------- #
+# diff_last_turn (feeds the review agent)
+# --------------------------------------------------------------------------- #
+
+
+def test_diff_last_turn_empty_when_no_turn(tmp_path: Path) -> None:
+    store = CheckpointStore(root=tmp_path, store_dir=tmp_path / "checkpoints")
+    assert store.diff_last_turn() == ""
+
+
+def test_diff_last_turn_shows_modification(tmp_path: Path) -> None:
+    target = tmp_path / "a.txt"
+    target.write_text("line one\nline two\n", encoding="utf-8")
+    store = CheckpointStore(root=tmp_path, store_dir=tmp_path / "checkpoints")
+
+    store.begin_turn()
+    store.snapshot_before(str(target), _ctx(tmp_path))
+    # Mutate the file after the snapshot (as write/edit would).
+    target.write_text("line one\nline two changed\n", encoding="utf-8")
+    store.commit_turn()
+
+    diff = store.diff_last_turn()
+    assert "a.txt" in diff
+    assert "+line two changed" in diff
+    assert "-line two" in diff
+
+
+def test_diff_last_turn_shows_created_file(tmp_path: Path) -> None:
+    new_path = tmp_path / "new.txt"
+    store = CheckpointStore(root=tmp_path, store_dir=tmp_path / "checkpoints")
+
+    store.begin_turn()
+    store.snapshot_before(str(new_path), _ctx(tmp_path))  # records absence
+    new_path.write_text("brand new content\n", encoding="utf-8")
+    store.commit_turn()
+
+    diff = store.diff_last_turn()
+    assert "new.txt" in diff
+    assert "+brand new content" in diff

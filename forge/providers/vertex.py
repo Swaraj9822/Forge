@@ -275,10 +275,14 @@ class VertexProvider(Provider):
                 if self._interrupt.check():
                     return
 
-                # Wall-clock timeout guard between chunks (Req 2.8).
+                # Inactivity (idle) timeout guard: trips only when no chunk has
+                # arrived for `request_timeout_s`. The deadline is reset after
+                # every received chunk (below) so a response that is actively
+                # streaming tokens is never killed mid-flight -- only a stalled
+                # stream is (Req 2.8).
                 if time.monotonic() > deadline:
                     raise RequestTimeoutError(
-                        f"Vertex AI request exceeded "
+                        f"Vertex AI stream stalled for over "
                         f"{self._config.request_timeout_s}s."
                     )
 
@@ -290,6 +294,9 @@ class VertexProvider(Provider):
                     raise
                 except Exception as exc:  # noqa: BLE001
                     self._translate_and_raise(exc)
+
+                # A chunk arrived: reset the idle deadline.
+                deadline = time.monotonic() + self._config.request_timeout_s
 
                 for event in _parse_chunk(chunk):
                     yield event

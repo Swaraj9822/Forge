@@ -82,6 +82,40 @@ class _VerifyText:
         self._out.flush()
 
 
+class _ReviewText:
+    """Minimal review renderer that prints [review] lines (text mode)."""
+
+    def __init__(self, out: TextIO) -> None:
+        self._out = out
+
+    def on_review_start(self) -> None:
+        self._out.write("\n[review] reviewing the change...\n")
+        self._out.flush()
+
+    def on_review_result(self, result) -> None:  # noqa: ANN001
+        verdict = getattr(result, "verdict", "")
+        if verdict == "approved":
+            self._out.write("[review] approved\n")
+        else:
+            findings = getattr(result, "findings", []) or []
+            self._out.write(
+                f"[review] changes requested ({len(findings)} finding(s))\n"
+            )
+            for finding in findings:
+                self._out.write(f"    - {finding}\n")
+        self._out.flush()
+
+    def on_review_correction(self, iteration: int, max_iterations: int) -> None:
+        self._out.write(f"[review] correction {iteration}/{max_iterations}\n")
+        self._out.flush()
+
+    def on_review_cap_reached(self, result, iterations: int) -> None:  # noqa: ANN001
+        self._out.write(
+            f"[review] cap reached ({iterations}); changes still requested\n"
+        )
+        self._out.flush()
+
+
 def run_headless(
     agent_loop: AgentLoop,
     session: Session,
@@ -93,6 +127,7 @@ def run_headless(
     yes: bool = False,
     max_turns: int | None = None,
     max_cost: float | None = None,
+    review_coordinator=None,
 ) -> int:
     """Run one prompt to completion and render/serialize the result.
 
@@ -149,11 +184,26 @@ def run_headless(
     if verification_coordinator is not None and turn_ok:
         phase = verification_coordinator.run(session, result)
 
-    usage = phase.usage if (phase is not None and phase.ran) else result.usage
+    # Review phase (opt-in) runs after verification. Its renderer is silenced in
+    # json mode. Its aggregated usage supersedes the reported usage when it ran.
+    review_phase = None
+    if review_coordinator is not None and turn_ok:
+        if hasattr(review_coordinator, "set_renderer"):
+            review_coordinator.set_renderer(
+                _ReviewText(out) if output == "text" else None
+            )
+        review_phase = review_coordinator.run(session, result)
+
+    if review_phase is not None and review_phase.ran:
+        usage = review_phase.usage
+    elif phase is not None and phase.ran:
+        usage = phase.usage
+    else:
+        usage = result.usage
     code = _exit_code(result, phase)
 
     if output == "json":
-        _emit_json(out, session, result, phase, usage, response_text, code)
+        _emit_json(out, session, result, phase, usage, response_text, code, review_phase)
     else:
         _emit_text_footer(out, result, phase, usage)
     return code
@@ -184,7 +234,7 @@ def _usage_dict(u: UsageSummary) -> dict:
     }
 
 
-def _emit_json(out, session, result, phase, usage, response_text, code) -> None:
+def _emit_json(out, session, result, phase, usage, response_text, code, review_phase=None) -> None:
     verification = None
     if phase is not None and phase.ran:
         fr = phase.final_result
@@ -193,6 +243,16 @@ def _emit_json(out, session, result, phase, usage, response_text, code) -> None:
             "outcome": (fr.outcome if fr is not None else None),
             "iterations": phase.iterations_performed,
             "cap_reached": phase.cap_reached,
+        }
+    review = None
+    if review_phase is not None and review_phase.ran:
+        rr = review_phase.final_result
+        review = {
+            "ran": True,
+            "verdict": (rr.verdict if rr is not None else None),
+            "findings": (list(rr.findings) if rr is not None else []),
+            "iterations": review_phase.iterations_performed,
+            "cap_reached": review_phase.cap_reached,
         }
     payload = {
         "session_id": session.id,
@@ -204,6 +264,7 @@ def _emit_json(out, session, result, phase, usage, response_text, code) -> None:
         "mutated_files": result.mutated_files,
         "usage": _usage_dict(usage),
         "verification": verification,
+        "review": review,
         "todos": [{"id": t.id, "text": t.text, "status": t.status} for t in session.todos],
     }
     out.write(json.dumps(payload, ensure_ascii=False, indent=2) + "\n")

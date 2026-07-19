@@ -30,7 +30,7 @@ This manual covers everything you need to configure and use Forge.
 12. [Repository map](#12-repository-map)
 13. [Planning and todos](#13-planning-and-todos)
 14. [Checkpoints and undo](#14-checkpoints-and-undo)
-15. [Verification loop](#15-verification-loop)
+15. [Verification and review](#15-verification-and-review)
 16. [Subagents (delegation)](#16-subagents-delegation)
 17. [Parallel tool execution](#17-parallel-tool-execution)
 18. [MCP servers](#18-mcp-servers)
@@ -165,6 +165,13 @@ All keys are optional; anything absent falls back to the default shown.
 | `rate_limit_retries` | `5` | Rate-limit retry attempts with backoff. |
 | `mcp_connect_timeout_s` | `30` | Per-MCP-server connect budget. |
 
+Every limit is validated at load: values must be integers (booleans, strings,
+and decimals are rejected) and non-negative, and the ones that must be strictly
+positive — `token_limit`, `request_timeout_s`, `shell_timeout_s`,
+`mcp_connect_timeout_s`, `read_max_lines`, `read_max_bytes`,
+`search_result_limit`, `search_line_cap` — reject `0`. A bad value fails fast at
+startup with a message naming the offending key rather than surfacing later.
+
 **`[pricing]`** — enables cost estimates.
 
 | Key | Default | Meaning |
@@ -232,7 +239,7 @@ If either is unset, Forge shows token counts but reports "cost unavailable".
 | `default_tools` | `[read, search, repo_index, search_memory]` | Tools a subagent may use. |
 | `max_turns` | `4` | Max round-trips per subagent. |
 
-**`[verification]`** (see [section 15](#15-verification-loop))
+**`[verification]`** (see [section 15](#15-verification-and-review))
 
 | Key | Default | Meaning |
 |-----|---------|---------|
@@ -240,6 +247,15 @@ If either is unset, Forge shows token counts but reports "cost unavailable".
 | `trigger` | `on_file_change` | `on_file_change` or `always`. |
 | `max_correction_iterations` | `3` | Self-correction attempts on failure. |
 | `timeout_s` | `shell_timeout_s` | Timeout for the verify command. |
+
+**`[review]`** (see [section 15](#15-verification-and-review))
+
+| Key | Default | Meaning |
+|-----|---------|---------|
+| `enabled` | `false` | Turn on the post-turn independent review agent. |
+| `trigger` | `on_file_change` | `on_file_change` (only review turns that changed files) or `always`. |
+| `max_iterations` | `2` | Max review→fix→re-review cycles. `0` = advisory (review once, no auto-fix). |
+| `tools` | `[read, search, repo_index, git]` | Read-only tools the reviewer may use. |
 
 **`[mcp_servers]`** — a list of MCP server definitions (see [section 18](#18-mcp-servers)).
 
@@ -369,8 +385,8 @@ forge -p "run the tests and fix failures" --yes --max-turns 20 --max-cost 0.50
 ```
 
 **JSON output** contains: `session_id`, `ok`, `response`, `error`,
-`interrupted`, `budget_exceeded`, `mutated_files`, `usage`, `verification`, and
-`todos`.
+`interrupted`, `budget_exceeded`, `mutated_files`, `usage`, `verification`,
+`review`, and `todos`.
 
 **Exit codes** (stable contract for CI):
 
@@ -448,11 +464,24 @@ narrow, safe git subcommands rather than a bare `git`.
 
 ### 7.3 Git operation gating
 
-The `git` tool is gated per operation. Read-only operations
-(`status`, `diff`, `log`, `show`, `branch`) run without a prompt; everything
-else — `add`, `commit`, `checkout`, `stash`, and any unrecognized operation —
-requires approval in supervised mode and is forbidden in readonly mode. (The
-policy fails closed: an operation it doesn't recognize is treated as mutating.)
+The `git` tool is gated per operation **and** per argument. The operations
+`status`, `diff`, `log`, `show`, and `branch` are read-only *only when their
+arguments have no side effects*, and then run without a prompt. Everything else
+— `add`, `commit`, `checkout`, `stash`, and any unrecognized operation —
+requires approval in supervised mode and is forbidden in readonly mode.
+
+The policy fails closed on arguments as well as operations:
+
+- `git branch` is read-only only when listing (e.g. `-a`, `--list`,
+  `--show-current`). `git branch` with a mutating flag or a positional branch
+  name — `git branch -D main`, `-d`, `-m`/`-M`, `-c`, `-f`,
+  `--set-upstream-to`, or `git branch newbranch` (which *creates* a branch) —
+  is treated as mutating and gated.
+- Any otherwise read-only op carrying an output-redirection flag
+  (`-o` / `--output`, e.g. `git diff --output=FILE`) writes a file and is
+  therefore gated too.
+- An operation (or a `branch` argument) the policy doesn't recognize is treated
+  as mutating, not waved through.
 
 ### 7.4 Diffs
 
@@ -495,7 +524,9 @@ launched Forge from); paths that resolve outside it are refused.
 Runs a command through the platform default shell (`cmd.exe /C` on Windows,
 `/bin/sh -c` on Unix), rooted at the workspace. It enforces the timeout, caps
 combined output, and terminates the whole process tree on timeout or interrupt.
-It returns stdout, stderr, and the exit code.
+It returns stdout, stderr, and the exit code. Output is also bounded in memory
+while the command runs, so a runaway command that emits unbounded output (e.g.
+`yes`) cannot exhaust memory before the output is truncated.
 
 ### git tool
 
@@ -605,7 +636,10 @@ survive between runs.
 - **Staleness**: a memory tied to files is dropped from results once those files
   change (or go missing) after the memory was recorded, so stale notes don't
   mislead the model.
-- The store is capped at `max_records`; the oldest are pruned.
+- The store is capped at `max_records`; the oldest are pruned. Writes (append +
+  prune) are guarded by a best-effort cross-process lock, so two Forge processes
+  sharing a workspace won't lose a memory in the prune cycle; if the lock can't
+  be taken, the note is still appended and pruning is deferred.
 
 Memory is stored per-workspace at `.forge/memory.jsonl`.
 
@@ -672,7 +706,9 @@ Note: checkpoints cover the `write`/`edit` tools. Changes made by arbitrary
 
 ---
 
-## 15. Verification loop
+## 15. Verification and review
+
+### 15.1 Verification loop
 
 Forge can automatically run a verification command after a turn and, on failure,
 feed the output back to the model to self-correct. It is **opt-in**: set
@@ -694,6 +730,46 @@ max_correction_iterations = 3
 - Progress is shown as `[verify]` lines. Tokens spent on correction turns are
   folded into the turn's reported usage.
 - In headless mode, a still-failing verification yields exit code `4`.
+
+### 15.2 Independent code review (review agent)
+
+With `review.enabled`, Forge runs an **independent review agent** after any turn
+that changed files. It is a fresh subagent — its own short context, read-only
+tools (`review.tools`, default `read`/`search`/`repo_index`/`git`), and no access
+to the implementer's reasoning — so it reviews the change with genuinely fresh
+eyes.
+
+The reviewer is given the original task, the current plan (todo list), and the
+**diff of what the turn changed** (from the checkpoint store, so it works even
+outside a git repo). It judges:
+
+1. **Plan adherence** — was the task/plan actually implemented?
+2. **Wiring** — is the new code integrated (imported, called, registered) and
+   not dead?
+3. **Scope** — are edits to existing code justified by the task, with no
+   unrelated or regressive changes? (It does *not* forbid touching existing
+   code — only unjustified changes.)
+4. **Correctness & gaps** — obvious bugs, missing error handling, or cases the
+   change should cover but doesn't.
+
+It ends with a structured verdict:
+
+- **APPROVE** — the phase ends.
+- **CHANGES_REQUESTED** — the findings are fed back to the coding agent as a
+  correction turn, then the code is re-reviewed, up to `review.max_iterations`
+  cycles. `max_iterations = 0` makes review **advisory** (it reviews once and
+  reports, but performs no automatic fixes).
+
+Progress is shown as `[review]` lines; the reviewer's tokens are folded into the
+turn's usage and cost. In headless `--output json`, a `review` object reports
+`{ran, verdict, findings, iterations, cap_reached}`.
+
+Review is deliberately separate from verification: **verification runs your
+tests** (does it work?), while **review reads the change** (was it done right?).
+Run both for the strongest safety net — verification first, then review. Because
+the reviewer can request changes on subjective grounds, keep it a complement to
+tests, not a replacement: objective signals (a green suite) remain your hard
+gate.
 
 ---
 
@@ -750,6 +826,10 @@ env = { LOG_LEVEL = "ERROR" }
   name, the first one connected wins. Each exclusion is warned about.
 - MCP tools are treated as non-read-only, so they follow the same approval
   policy as other mutating tools.
+- **Call timeout.** Each MCP tool call is bounded by a wall-clock timeout
+  (60s by default). A server that stops responding no longer freezes the agent
+  turn: the call is abandoned and returned as an error result so the model can
+  adapt or move on.
 
 If the `mcp` package isn't installed but servers are configured, Forge warns and
 runs with the built-in tools only.
@@ -862,6 +942,11 @@ Export the key for your provider (`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, or your
 
 **Config file … contains a syntax error.**
 Fix the reported line/column in `config.toml` (it's TOML).
+
+**"limits.… must be an integer / must be >= 1".**
+A `[limits]` value (or `verification.timeout_s`) is the wrong type or out of
+range. Set it to a non-negative integer — a positive one for timeouts, caps, and
+`token_limit`.
 
 **A headless run refuses to write/edit/run shell.**
 That's supervised/readonly mode declining a mutation non-interactively. Pass

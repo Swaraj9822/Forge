@@ -13,11 +13,13 @@ import json
 import os
 import re
 import tempfile
+import time
 import uuid
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 
 
 @dataclass(frozen=True)
@@ -82,6 +84,13 @@ _SECRET_PATTERNS: list[re.Pattern[str]] = [
 ]
 
 _REDACTED_PLACEHOLDER = "«redacted»"
+
+# Bounds for the best-effort cross-process write lock used around prune's
+# read-modify-rewrite. Acquisition waits up to _WRITE_LOCK_TIMEOUT_S; a lock
+# file older than _WRITE_LOCK_STALE_S is assumed abandoned by a crashed process
+# and reclaimed.
+_WRITE_LOCK_TIMEOUT_S = 2.0
+_WRITE_LOCK_STALE_S = 30.0
 
 
 def redact_secrets(text: str) -> str:
@@ -249,7 +258,12 @@ class MemoryStore:
     ) -> MemoryRecord:
         """Redact secrets, create a record, and append it atomically.
 
-        Prunes to max_records after appending.
+        The append and the subsequent prune run under a best-effort
+        cross-process write lock so a concurrent Forge process cannot lose a
+        record in the read-modify-rewrite prune cycle. If the lock cannot be
+        acquired (contention or a stale lock), the record is still appended
+        losslessly and pruning is simply deferred to a later ``add`` — durability
+        is never sacrificed for size enforcement.
         """
         redacted = redact_secrets(text)
         record = MemoryRecord(
@@ -264,10 +278,12 @@ class MemoryStore:
         # Ensure parent directory exists
         self._path.parent.mkdir(parents=True, exist_ok=True)
 
-        # Append atomically: write to temp file in same dir, then os.replace
-        # For append, we read existing + new line, write temp, replace
-        self._append_record(record)
-        self.prune()
+        # Append then prune under one lock hold so the prune rewrite cannot
+        # clobber a record appended by another process.
+        with self._write_lock() as acquired:
+            self._append_record(record)
+            if acquired:
+                self._prune_locked()
         return record
 
     def all(self) -> list[MemoryRecord]:
@@ -310,7 +326,22 @@ class MemoryStore:
         )
 
     def prune(self) -> None:
-        """Keep only the newest max_records, dropping the rest."""
+        """Keep only the newest max_records, dropping the rest.
+
+        Runs the read-modify-rewrite under the write lock so a concurrent
+        append is not lost. If the lock cannot be acquired, pruning is skipped
+        (another process likely holds it); size is enforced on a later call.
+        """
+        with self._write_lock() as acquired:
+            if acquired:
+                self._prune_locked()
+
+    def _prune_locked(self) -> None:
+        """Enforce ``max_records``; caller must hold the write lock.
+
+        Re-reads the file so the rewrite reflects every record present at prune
+        time (including any appended since the enclosing operation began).
+        """
         records = self.all()
         if len(records) <= self._max_records:
             return
@@ -326,6 +357,62 @@ class MemoryStore:
 
         # Rewrite atomically
         self._write_all(kept)
+
+    @contextmanager
+    def _write_lock(self) -> Iterator[bool]:
+        """Best-effort cross-process advisory lock for write/prune operations.
+
+        Yields ``True`` when the lock was acquired, ``False`` otherwise. The
+        lock is a sibling ``<name>.lock`` file created with ``O_CREAT|O_EXCL``;
+        a stale lock left by a crashed process (older than
+        :data:`_WRITE_LOCK_STALE_S`) is reclaimed. Acquisition is bounded by
+        :data:`_WRITE_LOCK_TIMEOUT_S`; callers that receive ``False`` must still
+        behave correctly (append is atomic on its own; only pruning is skipped).
+        """
+        lock_path = self._path.with_name(self._path.name + ".lock")
+        parent = self._path.parent
+        try:
+            parent.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            pass
+
+        fd: int | None = None
+        deadline = time.monotonic() + _WRITE_LOCK_TIMEOUT_S
+        while True:
+            try:
+                fd = os.open(
+                    str(lock_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY
+                )
+                break
+            except FileExistsError:
+                # Reclaim a stale lock from a crashed holder, else back off.
+                try:
+                    age = time.time() - os.path.getmtime(lock_path)
+                    if age > _WRITE_LOCK_STALE_S:
+                        os.unlink(lock_path)
+                        continue
+                except OSError:
+                    pass
+                if time.monotonic() >= deadline:
+                    yield False
+                    return
+                time.sleep(0.02)
+            except OSError:
+                # Filesystem does not permit the lock file; degrade to no lock.
+                yield False
+                return
+
+        try:
+            yield True
+        finally:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+            try:
+                os.unlink(lock_path)
+            except OSError:
+                pass
 
     def _append_record(self, record: MemoryRecord) -> None:
         """Append a single record to the JSONL file.

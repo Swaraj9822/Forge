@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import threading
 import uuid
 from dataclasses import dataclass, field
@@ -113,6 +114,26 @@ class VerificationRecord:
 
 
 @dataclass
+class ReviewRecord:
+    """A persisted record of one completed Review_Phase.
+
+    Captures the final verdict of an independent review agent's pass over a
+    turn's implementation and the bounded correction loop that followed it.
+
+    ``verdict`` is one of "approved" | "changes_requested" | "error".
+    ``iterations`` is the number of correction turns performed.
+    ``cap_reached`` is ``True`` when the phase ended at the iteration cap while
+    the reviewer was still requesting changes.
+    ``findings`` is the number of distinct issues the final review reported.
+    """
+
+    verdict: str
+    iterations: int
+    cap_reached: bool
+    findings: int
+
+
+@dataclass
 class Session:
     """A persisted record of a conversation."""
 
@@ -127,6 +148,7 @@ class Session:
         )
     )
     verification_records: list[VerificationRecord] = field(default_factory=list)
+    review_records: list[ReviewRecord] = field(default_factory=list)
 
 
 @dataclass
@@ -259,6 +281,24 @@ def _verification_record_from_dict(data: dict) -> VerificationRecord:
     )
 
 
+def _review_record_to_dict(record: ReviewRecord) -> dict:
+    return {
+        "verdict": record.verdict,
+        "iterations": record.iterations,
+        "cap_reached": record.cap_reached,
+        "findings": record.findings,
+    }
+
+
+def _review_record_from_dict(data: dict) -> ReviewRecord:
+    return ReviewRecord(
+        verdict=data["verdict"],
+        iterations=data["iterations"],
+        cap_reached=data["cap_reached"],
+        findings=data["findings"],
+    )
+
+
 def session_to_dict(session: Session) -> dict:
     """Convert a ``Session`` into a JSON-serializable plain ``dict``."""
     return {
@@ -270,6 +310,9 @@ def session_to_dict(session: Session) -> dict:
         "usage": _usage_to_dict(session.usage),
         "verification_records": [
             _verification_record_to_dict(r) for r in session.verification_records
+        ],
+        "review_records": [
+            _review_record_to_dict(r) for r in session.review_records
         ],
     }
 
@@ -286,6 +329,9 @@ def session_from_dict(data: dict) -> Session:
         verification_records=[
             _verification_record_from_dict(r)
             for r in data.get("verification_records", [])
+        ],
+        review_records=[
+            _review_record_from_dict(r) for r in data.get("review_records", [])
         ],
     )
 
@@ -343,6 +389,39 @@ class CorruptSessionError(SessionStoreError):
         super().__init__(message)
 
 
+class InvalidSessionIdError(SessionStoreError):
+    """Raised when a session id is not a safe single-path-component name.
+
+    A session id becomes ``<id>.json`` under the store root, so an id
+    containing path separators or parent references (``../../x``) would escape
+    the sessions directory. Rejecting such ids up front closes that traversal
+    on both the read path (``forge resume <id>``) and the write path (a loaded
+    session carrying a crafted internal ``id``).
+    """
+
+    def __init__(self, session_id: object) -> None:
+        self.session_id = session_id
+        super().__init__(f"Invalid session id: {session_id!r}")
+
+
+# A session id must be a safe, single filename component. Restricting it to this
+# charset (and rejecting parent references) prevents a crafted id from escaping
+# the store root via path traversal. UUIDv4 ids (the only ids ``new()`` mints)
+# always satisfy it; the pattern is permissive enough for hand-written ids
+# ("s1", "session-1", "-tmp") while excluding path separators (``/``, ``\``),
+# a leading ``.`` (hidden/relative names), and ``..``.
+_SAFE_SESSION_ID_RE = re.compile(r"^[A-Za-z0-9_-][A-Za-z0-9._-]{0,254}$")
+
+
+def is_valid_session_id(session_id: object) -> bool:
+    """Return ``True`` when ``session_id`` is a safe single-path-component id."""
+    return (
+        isinstance(session_id, str)
+        and _SAFE_SESSION_ID_RE.fullmatch(session_id) is not None
+        and ".." not in session_id
+    )
+
+
 def _utc_now_iso() -> str:
     """Current time as an ISO-8601 UTC timestamp."""
     return datetime.now(timezone.utc).isoformat()
@@ -373,7 +452,15 @@ class SessionStore:
             return lock
 
     def _path_for(self, session_id: str) -> Path:
-        return self.root / f"{session_id}.json"
+        # Reject unsafe ids before they touch the filesystem, then verify the
+        # resolved path stays directly under the store root (defense in depth
+        # against any traversal the charset check might miss).
+        if not is_valid_session_id(session_id):
+            raise InvalidSessionIdError(session_id)
+        path = self.root / f"{session_id}.json"
+        if path.resolve().parent != self.root.resolve():
+            raise InvalidSessionIdError(session_id)
+        return path
 
     def new(self) -> Session:
         """Mint a fresh in-memory Session (UUIDv4 id, UTC timestamps).
@@ -429,7 +516,15 @@ class SessionStore:
         Raises :class:`SessionNotFoundError` for an unknown id (Req 13.6) and
         :class:`CorruptSessionError` when the file exists but cannot be parsed,
         leaving the on-disk bytes untouched (Req 13.7).
+
+        An id that is not a safe single-path-component name (e.g. one carrying
+        path separators or ``..``) cannot name a stored session, so it is
+        reported as :class:`SessionNotFoundError` rather than being used to
+        read a file outside the store root.
         """
+
+        if not is_valid_session_id(session_id):
+            raise SessionNotFoundError(session_id)
 
         target = self._path_for(session_id)
         if not target.exists():

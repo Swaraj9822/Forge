@@ -30,3 +30,8 @@ htmlcov/
 .DS_Store
 Thumbs.db
 .kiro
+.vscode/
+
+# Forge local state (checkpoints, ferments, etc.)
+.forge/
+.kimchi/

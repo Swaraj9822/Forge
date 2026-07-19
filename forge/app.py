@@ -76,6 +76,7 @@ from forge.tools.search import SearchTool
 from forge.tools.shell import ShellTool
 from forge.tools.subagent import DelegateTool
 from forge.verification import VerificationCoordinator, VerificationRunner
+from forge.review import ReviewCoordinator
 from forge.providers import Provider, build_provider, CredentialsError
 from forge.ui import Ui
 from forge.commands import SlashCommandStore
@@ -147,6 +148,7 @@ class App:
     repl: Repl
     verification_runner: VerificationRunner
     verification_coordinator: VerificationCoordinator
+    review_coordinator: ReviewCoordinator
     mcp_client: McpClient | None = None
 
     def run(self) -> None:
@@ -430,6 +432,7 @@ def run_prompt(
             yes=yes,
             max_turns=max_turns,
             max_cost=max_cost,
+            review_coordinator=app.review_coordinator,
         )
     finally:
         app.close()
@@ -654,6 +657,28 @@ def bootstrap(
     )
     repl.verification_coordinator = verification_coordinator
 
+    # 13. Review phase. An independent review agent inspects each file-changing
+    #     turn against the plan and, on a "changes requested" verdict, feeds
+    #     findings back through a bounded correction loop. Opt-in: when
+    #     `config.review.enabled` is False it short-circuits at its gate. It
+    #     reuses the same tool registry (so the reviewer subagent gets the
+    #     configured read-only tools) and the shared agent loop / session store.
+    review_coordinator = ReviewCoordinator(
+        config,
+        provider=provider,
+        agent_loop=agent_loop,
+        session_store=session_store,
+        interrupt=interrupt,
+        tool_registry=tool_executor.registry,
+        workspace_root=root,
+        checkpoint=checkpoint,
+        policy=tool_executor.context.policy,
+        approver=None,
+        parent_context=tool_executor.context,
+        renderer=repl,
+    )
+    repl.review_coordinator = review_coordinator
+
     return App(
         config=config,
         session=session,
@@ -668,6 +693,7 @@ def bootstrap(
         repl=repl,
         verification_runner=verification_runner,
         verification_coordinator=verification_coordinator,
+        review_coordinator=review_coordinator,
         mcp_client=mcp_client,
     )
 

@@ -68,6 +68,21 @@ DEFAULT_LIMITS: dict[str, int] = {
 # model's own default thinking level in place.
 THINKING_LEVELS: tuple[str, ...] = ("minimal", "low", "medium", "high")
 
+# Limits that must be strictly positive (a zero value is nonsensical: a zero
+# timeout, token budget, or read cap would make the affected subsystem
+# unusable). Every other limit is merely required to be a non-negative integer
+# (0 is meaningful for e.g. rate_limit_retries=no-retries or output_cap=cap-all).
+_POSITIVE_LIMITS: frozenset[str] = frozenset({
+    "token_limit",
+    "request_timeout_s",
+    "shell_timeout_s",
+    "mcp_connect_timeout_s",
+    "read_max_lines",
+    "read_max_bytes",
+    "search_result_limit",
+    "search_line_cap",
+})
+
 # Placeholders emitted by `forge init` for the two required values.
 PROJECT_PLACEHOLDER = "REPLACE_WITH_GCP_PROJECT_ID"
 REGION_PLACEHOLDER = "REPLACE_WITH_GCP_REGION"
@@ -187,6 +202,14 @@ def resolve_verification_config(
     timeout_s = raw.get("timeout_s")
     if timeout_s is None:
         timeout_s = shell_timeout_s
+    elif isinstance(timeout_s, bool) or not isinstance(timeout_s, int) or timeout_s < 1:
+        raise ConfigError(
+            ConfigManager.config_path(),
+            detail=(
+                "verification.timeout_s must be an integer >= 1, got "
+                f"{timeout_s!r}"
+            ),
+        )
 
     return VerificationConfig(
         command=command,
@@ -194,6 +217,87 @@ def resolve_verification_config(
         trigger=trigger,
         timeout_s=timeout_s,
         output_cap_chars=output_cap_chars,
+    )
+
+
+# Default read-only toolset the review agent may use to inspect the change.
+DEFAULT_REVIEW_TOOLS: tuple[str, ...] = ("read", "search", "repo_index", "git")
+
+
+@dataclass(frozen=True)
+class ReviewConfig:
+    """Resolved, validated configuration for the post-turn Review_Phase.
+
+    ``enabled`` of ``False`` (the default) means the feature is off (opt-in).
+    An independent review agent inspects a turn's implementation against the
+    plan and, on a "changes requested" verdict, feeds actionable findings back
+    to the coding agent within a bounded correction loop.
+    """
+
+    enabled: bool = False
+    trigger: str = "on_file_change"
+    max_iterations: int = 2
+    tools: tuple[str, ...] = DEFAULT_REVIEW_TOOLS
+
+
+# Allowed values for review.trigger (shares the verification trigger set).
+REVIEW_TRIGGERS: tuple[str, ...] = ("on_file_change", "always")
+
+
+def resolve_review_config(raw: dict[str, Any] | None) -> ReviewConfig:
+    """Resolve a ``[review]`` mapping into a :class:`ReviewConfig`.
+
+    Pure: applies documented defaults for absent values and validates present
+    ones, raising :class:`ConfigError` (naming the offending value) for an
+    invalid ``max_iterations``, ``trigger``, or ``tools`` entry.
+    """
+
+    raw = raw or {}
+
+    enabled = bool(raw.get("enabled", False))
+
+    if "max_iterations" in raw:
+        max_iters = raw["max_iterations"]
+        if isinstance(max_iters, bool) or not isinstance(max_iters, int) or max_iters < 0:
+            raise ConfigError(
+                ConfigManager.config_path(),
+                detail=(
+                    "review.max_iterations must be an integer >= 0, got "
+                    f"{max_iters!r}"
+                ),
+            )
+    else:
+        max_iters = 2
+
+    if "trigger" in raw:
+        trigger = raw["trigger"]
+        if trigger not in REVIEW_TRIGGERS:
+            allowed = ", ".join(REVIEW_TRIGGERS)
+            raise ConfigError(
+                ConfigManager.config_path(),
+                detail=f"review.trigger must be one of {{{allowed}}}, got {trigger!r}",
+            )
+    else:
+        trigger = "on_file_change"
+
+    if "tools" in raw:
+        tools_raw = raw["tools"]
+        if not isinstance(tools_raw, list) or not all(
+            isinstance(t, str) for t in tools_raw
+        ):
+            raise ConfigError(
+                ConfigManager.config_path(),
+                detail="review.tools must be a list of tool-name strings.",
+            )
+        tools = tuple(tools_raw)
+    else:
+        tools = DEFAULT_REVIEW_TOOLS
+
+    return ReviewConfig(
+        enabled=enabled,
+        trigger=trigger,
+        max_iterations=max_iters,
+        tools=tools,
     )
 
 
@@ -279,6 +383,7 @@ class Config:
     mcp_servers: list[McpServerConfig] = field(default_factory=list)
     pricing: ModelPricing = field(default_factory=lambda: ModelPricing(None, None))
     verification: VerificationConfig = field(default_factory=VerificationConfig)
+    review: ReviewConfig = field(default_factory=ReviewConfig)
     plan_reminder: bool = True
     project_memory: bool = True
     # Phase 2: autonomy / approval policy + checkpoint store.
@@ -417,6 +522,27 @@ class ConfigManager:
             key: limits.get(key, default) for key, default in DEFAULT_LIMITS.items()
         }
 
+        # Validate every limit: reject wrong types (bool/str/float), negatives,
+        # and zero for limits that must be strictly positive, so a bad value
+        # fails fast at load with a clear message rather than surfacing as an
+        # obscure error deep in a later subsystem.
+        for key, value in merged_limits.items():
+            if isinstance(value, bool) or not isinstance(value, int):
+                raise ConfigError(
+                    ConfigManager.config_path(),
+                    detail=f"limits.{key} must be an integer, got {value!r}",
+                )
+            if value < 0:
+                raise ConfigError(
+                    ConfigManager.config_path(),
+                    detail=f"limits.{key} must be >= 0, got {value}",
+                )
+            if key in _POSITIVE_LIMITS and value == 0:
+                raise ConfigError(
+                    ConfigManager.config_path(),
+                    detail=f"limits.{key} must be >= 1, got 0",
+                )
+
         plan_reminder = bool(context_raw.get("plan_reminder", True))
         project_memory = bool(context_raw.get("project_memory", True))
 
@@ -487,6 +613,8 @@ class ConfigManager:
             shell_timeout_s=merged_limits["shell_timeout_s"],
             output_cap_chars=merged_limits["output_cap_chars"],
         )
+
+        review = resolve_review_config(raw.get("review"))
 
         policy_mode, shell_allowlist, show_diffs = resolve_policy_config(
             raw.get("policy")
@@ -607,6 +735,7 @@ class ConfigManager:
             mcp_servers=mcp_servers,
             pricing=pricing,
             verification=verification,
+            review=review,
             plan_reminder=plan_reminder,
             project_memory=project_memory,
             policy_mode=policy_mode,
@@ -754,6 +883,12 @@ class ConfigManager:
                 "enabled": False,
                 "default_tools": ["read", "search", "repo_index", "search_memory"],
                 "max_turns": 4,
+            },
+            "review": {
+                "enabled": False,
+                "trigger": "on_file_change",
+                "max_iterations": 2,
+                "tools": ["read", "search", "repo_index", "git"],
             },
         }
 
